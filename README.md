@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash EXL3 on DGX Spark
 
-Turnkey serving recipes for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10, with separate **TP2 (2 Spark)** and **TP4 (4 Spark)** paths.
+Turnkey serving recipes for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10, with separate **TP2 (2 Spark)** and **TP4 (4 Spark)** paths, plus an experimental **one-GPU `sm_120` + large-host-RAM UVA** qualification path.
 
 > **Runtime boundary:** this repository uses the dedicated DeepSeek-V4.1 **vLLM** implementation for the V4.1 model graph. `vllm-exl3` supplies EXL3 routed-expert integration. Stock standalone ExLlamaV3 does **not** currently provide a forward-correct `DeepseekV41ForCausalLM` loader with V4.1 CED/CSA2/Engram support. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
@@ -12,11 +12,11 @@ The recipe uses `vcruz305/DSV4.1-Flash-EXL3-4.75bpw` as the default `MODEL` in `
 
 This repository is a runtime/serving recipe. It does not contain model weights and it does not quantize the model. Override `MODEL` when testing a topology-specific or local EXL3 checkpoint.
 
-> **Status:** early hardware qualification. TP4+EP4 is the preferred correctness-first topology. TP2+EP2 is intentionally experimental and requires a sufficiently small EXL3 pack. The ABI-3 native EXL3 MoE path is opt-in until it has full GB10 parity and throughput receipts.
+> **Status:** early hardware qualification. TP4+EP4 remains the preferred correctness-first DGX Spark topology. TP2+EP2 is intentionally experimental. The one-GPU `sm_120` path is also experimental and uses **current vLLM selective UVA offload**, not the older Spark container and not CPU-MoE compute.
 
-For the small-GPU + large-host-RAM interoperability report from Lna-Lab/TonoKen3, use [`docs/TONOKEN3_VALIDATION.md`](docs/TONOKEN3_VALIDATION.md). That path is intentionally treated as a separate topology rather than being described as “TP4 on fewer GPUs.”
+For the Lna-Lab/TonoKen3 small-GPU report, start with [`docs/SM120_UVA.md`](docs/SM120_UVA.md) and then follow [`docs/TONOKEN3_VALIDATION.md`](docs/TONOKEN3_VALIDATION.md).
 
-## Pinned runtime
+## Pinned Spark runtime
 
 | Component | Pin |
 |---|---|
@@ -29,7 +29,7 @@ For the small-GPU + large-host-RAM interoperability report from Lna-Lab/TonoKen3
 
 The base image is DeepSeek/vLLM's dedicated V4.1 image. The EXL3 plugin is installed on top of that image; the recipe never upgrades or replaces the image's vLLM package.
 
-The CUDA architecture is configurable at build time. For a CUDA 12.8 environment whose toolchain reports an `sm_120` GPU, use:
+The CUDA architecture is configurable at build time. For a CUDA 12.8 environment whose toolchain reports an `sm_120` GPU, compile extensions with the corresponding target, normally:
 
 ```bash
 TORCH_CUDA_ARCH_LIST=12.0 ./scripts/build_runtime.sh
@@ -37,13 +37,41 @@ TORCH_CUDA_ARCH_LIST=12.0 ./scripts/build_runtime.sh
 
 That only selects extension compilation targets. It is **not** a claim that every vLLM/FlashInfer/kernel path is qualified on that GPU.
 
-## Why TP + EP
+## Experimental one-GPU `sm_120` + host-RAM path
+
+Current upstream vLLM adds a shorter route for the reported 16 GB Blackwell + 1 TiB RAM topology:
+
+- V4.1 Engram can live in pinned host memory and be accessed through UVA;
+- selected model parameters can be put in pinned host memory through vLLM's `uva` offloader;
+- `vllm-exl3` now has an opt-in guard that requires the six large packed EXL3 expert payloads to be vLLM UVA-mapped before its EXL3 handles/pointer tables are accepted.
+
+The expert math still runs on the **GPU**. This is zero-copy host-memory execution over UVA/PCIe, not CPU-MoE.
+
+The design reference is current vLLM commit `988d9b6777d077f843cd2164a222ac8535d36ed2` and `vllm-exl3` commit `1cb234b754566f1581f700a31ea5415879586a76` or newer. The older Spark image should **not** be assumed to contain those newer offload interfaces.
+
+In a prepared current-vLLM environment:
+
+```bash
+python scripts/preflight_sm120_uva.py
+./scripts/serve_sm120_uva.sh
+```
+
+The conservative launcher starts text-only, TP1, batch 1, eager, 8K context, DSpark off, Engram CPU/UVA on, and selectively offloads:
+
+```text
+w13_trellis  w13_suh  w13_svh
+w2_trellis   w2_suh   w2_svh
+```
+
+See [`docs/SM120_UVA.md`](docs/SM120_UVA.md) before running it. The model may require roughly **400–500 GiB-class pinned/mapped host state**, so a 1 TiB machine has raw capacity but still needs the driver/OS to accept that page-lock pressure.
+
+## Why TP + EP on Spark
 
 DeepSeek-V4.1-Flash has 384 routed experts, hidden size 5120, expert intermediate size 2304, and top-k 6 routing.
 
 | Recipe | Nodes | Main experts/rank | Expert shape/rank | Expected EXL3 path |
 |---|---:|---:|---:|---|
-| **TP4 + EP4** | 4 | **96** | **5120 x 2304** | Preferred. ExLlamaV3 expert kernel control first; ABI-3 native p2b optional A/B. |
+| **TP4 + EP4** | 4 | **96** | **5120 x 2304** | Preferred. ExLlamaV3 expert-kernel control first; ABI-3 native p2b optional A/B. |
 | **TP2 + EP2** | 2 | **192** | **5120 x 2304** | Experimental. Above the current 128-local-expert ExLlamaV3 fused envelope; use fallback for correctness or ABI-3 native p2b for an explicit experiment. |
 | TP4 without EP | 4 | 384 | **5120 x 576** | Not recommended: 576 leaves a 64-wide tail in 128-wide EXL3 native tiles. |
 
@@ -75,7 +103,7 @@ A `CONDITIONAL` CPU-MoE result is only a metadata preflight. It is not an end-to
 
 `vllm-exl3` exposes the delegated source block shape through the outer EXL3 config where V4.1 inspects global quantization metadata before individual dense layers select their source delegate.
 
-## Quick start
+## DGX Spark quick start
 
 Run the same recipe checkout and runtime image on every Spark.
 
@@ -157,7 +185,7 @@ Both launchers default to **text-only, eager mode, DSpark off** so the first var
 ./scripts/smoke_test.sh
 ```
 
-## Controlled A/B progression
+## Controlled Spark A/B progression
 
 Do not turn everything on at once. Use this order:
 
@@ -176,13 +204,15 @@ NATIVE_MOE=1 ./scripts/serve_tp4.sh
 
 The opt-in sets both `VLLM_EXL3_V41_NATIVE_MOE=1` and the EXL3 backend preference to native. An old extension cannot accidentally run the new geometry: V4.1 native eligibility requires `P2B_MOE_ABI_VERSION >= 3`.
 
-## CPU-offload boundary
+## CPU-compute offload boundary
 
-`vllm-exl3` currently has **no host-resident CPU expert executor**. A machine with one small GPU plus hundreds of GiB of host RAM therefore cannot get CPU-MoE simply by setting a vLLM flag in this recipe.
+`vllm-exl3` still has **no host-CPU expert compute backend**. The new UVA route is different: it keeps packed weights in host RAM but executes the expert kernels on the GPU.
 
-Current upstream ExLlamaV3 has an experimental CPU-MoE path, but it requires an architecture ExLlamaV3 can instantiate and currently expects `mul1`, K <= 8, plus uniform per-expert bias presence. Since upstream does not yet provide a forward-correct V4.1 architecture, that route remains blocked at the model-graph gate even if a particular pack's EXL3 metadata is otherwise eligible.
+Current upstream ExLlamaV3 has an experimental CPU-compute MoE path, but it requires an architecture ExLlamaV3 can instantiate and currently expects `mul1`, K <= 8, plus uniform per-expert bias presence. Since upstream does not yet provide a forward-correct V4.1 architecture, that route remains blocked at the model-graph gate even if a particular pack's EXL3 metadata is otherwise eligible.
 
-See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) and [`docs/TONOKEN3_VALIDATION.md`](docs/TONOKEN3_VALIDATION.md) for the staged route to qualify this topology.
+For a small-GPU host, test the current-vLLM UVA route first. If it is too PCIe-bound or cannot pin enough memory, continue the standalone ExLlamaV3 V4.1 port and CPU-MoE route.
+
+See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md), [`docs/SM120_UVA.md`](docs/SM120_UVA.md), and [`docs/TONOKEN3_VALIDATION.md`](docs/TONOKEN3_VALIDATION.md).
 
 ## TP2 is a separate target
 
@@ -231,21 +261,24 @@ This baseline does not silently patch Engram to disk or claim that the dedicated
 ## Repository layout
 
 ```text
-Dockerfile.spark                    pinned V4.1 + EXL3 runtime
-scripts/build_runtime.sh            build the shared runtime image
+Dockerfile.spark                    pinned V4.1 + EXL3 Spark runtime
+scripts/build_runtime.sh            build the shared Spark runtime image
 scripts/check_checkpoint_compat.py  fail-closed standalone metadata/CPU-MoE preflight
+scripts/preflight_sm120_uva.py      current-vLLM sm_120/UVA capability preflight
+scripts/serve_sm120_uva.sh          conservative one-GPU host-RAM/UVA launcher
 scripts/start_cluster.sh            Ray head/worker container launcher
 scripts/cluster_status.sh           cluster resource check
-scripts/preflight.py                checkpoint + ABI/topology validation
-scripts/preflight.sh                run preflight inside the head container
-scripts/serve.sh                    shared vLLM launcher
+scripts/preflight.py                Spark checkpoint + ABI/topology validation
+scripts/preflight.sh                run Spark preflight inside the head container
+scripts/serve.sh                    shared Spark vLLM launcher
 scripts/serve_tp4.sh                TP4+EP4 wrapper
 scripts/serve_tp2.sh                TP2+EP2 wrapper
 scripts/smoke_test.sh               OpenAI API smoke test
 scripts/runtime_identity.sh         reproducibility receipt
 configs/                            pack metadata examples
 docs/COMPATIBILITY.md               runtime/format/topology boundaries
-docs/TONOKEN3_VALIDATION.md         Lna-Lab small-GPU validation protocol
+docs/SM120_UVA.md                   one-GPU Blackwell + host-RAM qualification path
+docs/TONOKEN3_VALIDATION.md         Lna-Lab validation protocol
 docs/TP4.md                         four-Spark qualification path
 docs/TP2.md                         two-Spark qualification path
 ```
