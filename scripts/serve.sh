@@ -24,7 +24,9 @@ if [[ ! "$GPU_COUNT" =~ ^[0-9]+$ ]] || (( GPU_COUNT < TP )); then
 fi
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+# GB10 CPU and GPU share one 128 GB physical memory pool. Keep the public
+# first-boot default conservative; increase only from measured headroom.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.75}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 TEXT_ONLY="${TEXT_ONLY:-1}"
