@@ -103,10 +103,10 @@ A pass is only a **capability preflight**. It does not load the 453 GiB checkpoi
 
 ## First serving attempt
 
-The provided launcher is intentionally conservative:
+The provided launcher is intentionally conservative. Invoke it through Bash because files created through GitHub's contents API are not guaranteed to carry an executable bit:
 
 ```bash
-./scripts/serve_sm120_uva.sh
+bash scripts/serve_sm120_uva.sh
 ```
 
 Useful overrides:
@@ -116,7 +116,7 @@ MODEL=/models/DSV4.1-Flash-EXL3-4.75bpw \
 CPU_OFFLOAD_GB=300 \
 MAX_MODEL_LEN=8192 \
 GPU_MEMORY_UTILIZATION=0.80 \
-./scripts/serve_sm120_uva.sh
+bash scripts/serve_sm120_uva.sh
 ```
 
 The launcher uses:
