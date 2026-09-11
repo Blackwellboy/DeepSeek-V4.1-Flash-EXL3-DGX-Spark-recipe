@@ -1,0 +1,14 @@
+{
+  "quantization_config": {
+    "quant_method": "exl3",
+    "bits": 2,
+    "codebook": "mcg",
+    "scope": "deepseek_v41_routed_experts",
+    "non_routed_quantization": {
+      "quant_method": "deepseek_v4_fp8",
+      "weight_block_size": [32, 32],
+      "activation_scheme": "dynamic"
+    },
+    "mtp_experts": "source"
+  }
+}

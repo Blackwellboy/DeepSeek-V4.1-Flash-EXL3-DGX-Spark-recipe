@@ -1,1 +1,222 @@
-# DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe
+# DeepSeek-V4.1-Flash EXL3 on DGX Spark
+
+Turnkey serving recipes for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10, with separate **TP2 (2 Spark)** and **TP4 (4 Spark)** paths.
+
+This repository is a runtime/serving recipe. It does not contain model weights and it does not quantize the model. Point `MODEL` at a compatible EXL3 checkpoint produced for the topology you want to test.
+
+> **Status:** early hardware qualification. TP4+EP4 is the preferred correctness-first topology. TP2+EP2 is intentionally experimental and requires a sufficiently small EXL3 pack. The ABI-3 native EXL3 MoE path is opt-in until it has full GB10 parity and throughput receipts.
+
+## Pinned runtime
+
+| Component | Pin |
+|---|---|
+| DeepSeek V4.1 vLLM image | `vllm/vllm-openai:deepseekv41-flash-0909` |
+| vLLM requirement | 0.30.0+ architecture image; do **not** replace with stock pip vLLM |
+| `vllm-exl3` | `8f4517e80416466fa4a3ad2eb28685021d39e95f` |
+| ExLlamaV3 | `be57335b087e4f001c5caae061544df3c06ba01e` |
+| Spark CUDA target | `sm_121` / `TORCH_CUDA_ARCH_LIST=12.1a` |
+
+The base image is DeepSeek/vLLM's dedicated V4.1 image. The EXL3 plugin is installed on top of that image; the recipe never upgrades or replaces the image's vLLM package.
+
+## Why TP + EP
+
+DeepSeek-V4.1-Flash has 384 routed experts, hidden size 5120, expert intermediate size 2304, and top-k 6 routing.
+
+| Recipe | Nodes | Main experts/rank | Expert shape/rank | Expected EXL3 path |
+|---|---:|---:|---:|---|
+| **TP4 + EP4** | 4 | **96** | **5120 x 2304** | Preferred. ExLlamaV3 fused control first; ABI-3 native p2b optional A/B. |
+| **TP2 + EP2** | 2 | **192** | **5120 x 2304** | Experimental. Above the current 128-local-expert ExLlamaV3 fused envelope; use fallback for correctness or ABI-3 native p2b for an explicit experiment. |
+| TP4 without EP | 4 | 384 | 5120 x 576 | Not recommended: 576 leaves a 64-wide tail in 128-wide EXL3 native tiles. |
+
+With expert parallelism enabled, vLLM assigns **whole experts** to each rank. That is what makes TP4 especially attractive for EXL3 on Spark.
+
+## Required checkpoint metadata
+
+A V4.1 EXL3 pack that quantizes the main routed expert stack while keeping source-format dense weights and DSpark should preserve the original model config and include at least:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "exl3",
+    "bits": 2,
+    "codebook": "mcg",
+    "scope": "deepseek_v41_routed_experts",
+    "non_routed_quantization": {
+      "quant_method": "deepseek_v4_fp8",
+      "weight_block_size": [32, 32],
+      "activation_scheme": "dynamic"
+    },
+    "mtp_experts": "source"
+  }
+}
+```
+
+Mixed-K packs must preserve their `layer_bits` map. Do not flatten a K2/K3 pack to the base `bits` field.
+
+`vllm-exl3` exposes the delegated `[32,32]` source block shape through the outer EXL3 config because V4.1 inspects the global quantization config before individual dense layers select their source delegate.
+
+## Quick start
+
+Run the same recipe checkout and runtime image on every Spark.
+
+### 1. Build the pinned runtime image
+
+```bash
+./scripts/build_runtime.sh
+```
+
+The image layers the pinned EXL3 plugin and ExLlamaV3 onto the dedicated DeepSeek V4.1 image and verifies that the native extension reports ABI 3.
+
+### 2. Configure the model
+
+```bash
+cp .env.example .env
+# Edit .env and set MODEL to your local path or Hugging Face repo id.
+```
+
+If `MODEL` is local, set `MODEL_DIR` to a host directory mounted at `/models` on every Spark and set `MODEL=/models/<checkpoint-directory>`. Every node must see identical checkpoint contents.
+
+### 3. Start the Ray cluster
+
+Choose one Spark as the head. All nodes use host networking.
+
+Head:
+
+```bash
+HEAD_IP=10.0.0.10 NODE_IP=10.0.0.10 ./scripts/start_cluster.sh head
+```
+
+Each worker:
+
+```bash
+HEAD_IP=10.0.0.10 NODE_IP=10.0.0.11 ./scripts/start_cluster.sh worker
+```
+
+For TP4, start three workers. For TP2, start one worker.
+
+Check the head:
+
+```bash
+./scripts/cluster_status.sh
+```
+
+### 4. Preflight the checkpoint and plugin
+
+```bash
+./scripts/preflight.sh 4   # TP4
+./scripts/preflight.sh 2   # TP2
+```
+
+Preflight validates the V4.1 EXL3 metadata, prints the actual `vllm-exl3` diagnostics/ABI, and shows the expected expert layout before the expensive model load.
+
+### 5. Serve
+
+Preferred four-Spark control:
+
+```bash
+./scripts/serve_tp4.sh
+```
+
+Experimental two-Spark recipe:
+
+```bash
+./scripts/serve_tp2.sh
+```
+
+Both launchers default to **text-only, eager mode, DSpark off** so the first variable being tested is the model/EXL3 integration itself.
+
+### 6. Smoke test
+
+```bash
+./scripts/smoke_test.sh
+```
+
+## Controlled A/B progression
+
+Do not turn everything on at once. Use this order:
+
+1. **TP4+EP4 / ExLlamaV3 control**: `NATIVE_MOE=0 DSPARK=0 EAGER=1`.
+2. **Native ABI-3 A/B**: same checkpoint/prompts, set `NATIVE_MOE=1`.
+3. **DSpark-5**: set `DSPARK=1`; this recipe intentionally starts with adaptive verification disabled on Spark.
+4. **CUDA graphs**: set `EAGER=0` only after all runtime/JIT kernels have warmed successfully.
+5. **Context**: 64K -> 128K -> 300K -> longer only after measuring unified-memory headroom.
+6. **Vision**: set `TEXT_ONLY=0` after text serving is stable.
+
+Example native A/B on TP4:
+
+```bash
+NATIVE_MOE=1 ./scripts/serve_tp4.sh
+```
+
+The opt-in sets both `VLLM_EXL3_V41_NATIVE_MOE=1` and the EXL3 backend preference to native. An old extension cannot accidentally run the new geometry: V4.1 native eligibility requires `P2B_MOE_ABI_VERSION >= 3`.
+
+## TP2 is a separate target
+
+TP2 is **not just TP4 with two machines removed**. It has 192 whole experts per rank and only 256 GB of aggregate unified memory before runtime/KV/graph overhead. Use a checkpoint specifically sized for TP2 and expect Engram placement to be the dominant memory constraint.
+
+The TP2 launcher defaults to the ABI-3 native candidate because the current ExLlamaV3 fused MoE path has a 128-local-expert ceiling. To force a conservative fallback test:
+
+```bash
+NATIVE_MOE=0 ./scripts/serve_tp2.sh
+```
+
+Do not report TP2 performance until output parity, per-rank memory, actual backend dispatch, and long-running stability are captured.
+
+## Conservative GB10 defaults
+
+The official V4.1 runtime provides the `deepseek_v41` tokenizer mode, tool parser, reasoning parser, vision architecture and DSpark implementation. This recipe adds the EXL3 storage/execution layer; it does not fork those features.
+
+Defaults here are intentionally conservative:
+
+- `MAX_MODEL_LEN=65536`
+- `GPU_MEMORY_UTILIZATION=0.90`
+- `MAX_NUM_SEQS=4`
+- `MAX_NUM_BATCHED_TOKENS=4096`
+- `TEXT_ONLY=1`
+- `DSPARK=0`
+- `EAGER=1`
+
+Override them in `.env` or per command only after the baseline works.
+
+## Runtime identity
+
+Capture this before publishing any benchmark:
+
+```bash
+./scripts/runtime_identity.sh
+```
+
+Keep the image digest, plugin commit, ExLlamaV3 revision, CUDA/Torch/vLLM/FlashInfer versions, native ABI, Ray topology, model revision, backend selection, context settings and Engram placement with every result.
+
+## Engram and DGX Spark
+
+V4.1's two Engram tables are roughly 189 GiB in the source checkpoint. EXL3 reduces the routed-expert footprint, which may make resident Engram practical on TP4, but that must be measured rather than assumed. TP2 is substantially tighter.
+
+This baseline does not silently patch Engram to disk or claim that the dedicated upstream image is already fully Spark-qualified. If a given pack cannot hold resident Engram, record that failure and use a clearly identified disk/node-local Engram patch as a separate variant rather than mixing it into the EXL3 baseline.
+
+## Repository layout
+
+```text
+Dockerfile.spark              pinned V4.1 + EXL3 runtime
+scripts/build_runtime.sh      build the shared runtime image
+scripts/start_cluster.sh      Ray head/worker container launcher
+scripts/cluster_status.sh     cluster resource check
+scripts/preflight.py          checkpoint + ABI/topology validation
+scripts/preflight.sh          run preflight inside the head container
+scripts/serve.sh              shared vLLM launcher
+scripts/serve_tp4.sh          TP4+EP4 wrapper
+scripts/serve_tp2.sh          TP2+EP2 wrapper
+scripts/smoke_test.sh         OpenAI API smoke test
+scripts/runtime_identity.sh   reproducibility receipt
+configs/                      pack metadata examples
+docs/TP4.md                   four-Spark qualification path
+docs/TP2.md                   two-Spark qualification path
+```
+
+## Upstream projects and credit
+
+This recipe builds on DeepSeek, vLLM, Turboderp/ExLlamaV3, and `vcruz305/vllm-exl3`. See `THIRD_PARTY_NOTICES.md` for provenance and licensing boundaries.
+
+## License
+
+Recipe code authored in this repository is released under **AGPL-3.0-only**. Model weights, vLLM, ExLlamaV3, CUDA components and container layers keep their own licenses.

@@ -1,0 +1,64 @@
+ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
+ARG VLLM_EXL3_REF=8f4517e80416466fa4a3ad2eb28685021d39e95f
+ARG EXLLAMAV3_REF=be57335b087e4f001c5caae061544df3c06ba01e
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TORCH_CUDA_ARCH_LIST=12.1a \
+    MAX_JOBS=2 \
+    VLLM_EXL3_REF=${VLLM_EXL3_REF} \
+    EXLLAMAV3_REF=${EXLLAMAV3_REF} \
+    RECIPE_BASE_IMAGE=${BASE_IMAGE}
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git build-essential ninja-build ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the dedicated V4.1 vLLM package from the base image intact.
+RUN python - <<'PY'
+import sys
+assert sys.version_info >= (3, 12), sys.version
+import vllm
+print("base vLLM:", vllm.__version__)
+PY
+
+RUN python -m pip install --no-cache-dir --upgrade "setuptools>=77" wheel ninja \
+    && python -m pip install --no-cache-dir "ray[cgraph]"
+
+RUN git clone https://github.com/vcruz305/vllm-exl3.git /opt/vllm-exl3 \
+    && git -C /opt/vllm-exl3 checkout --detach ${VLLM_EXL3_REF} \
+    && test "$(git -C /opt/vllm-exl3 rev-parse HEAD)" = "${VLLM_EXL3_REF}"
+
+RUN git clone https://github.com/turboderp-org/exllamav3.git /opt/exllamav3 \
+    && git -C /opt/exllamav3 checkout --detach ${EXLLAMAV3_REF} \
+    && test "$(git -C /opt/exllamav3 rev-parse HEAD)" = "${EXLLAMAV3_REF}"
+
+# The patch is idempotent and only needed on aarch64. Keep x86 builds untouched.
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+      python /opt/vllm-exl3/tools/patch_exllamav3_aarch64.py \
+        /opt/exllamav3/exllamav3/exllamav3_ext --force; \
+    fi
+
+RUN python -m pip install --no-cache-dir --no-build-isolation /opt/exllamav3
+
+ENV EXL3_EXT_INCLUDE=/opt/exllamav3/exllamav3/exllamav3_ext
+RUN unset VLLM_EXL3_NO_CUDA \
+    && python -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/vllm-exl3
+
+RUN python - <<'PY'
+import vllm
+import vllm_exl3
+import vllm_exl3_c
+vllm_exl3.register()
+abi = int(getattr(vllm_exl3_c, "P2B_MOE_ABI_VERSION", 0))
+assert abi >= 3, f"expected EXL3 native MoE ABI >= 3, got {abi}"
+print("vLLM:", vllm.__version__)
+print("vllm-exl3 ABI:", abi)
+print(vllm_exl3.runtime_diagnostics())
+PY
+
+WORKDIR /workspace

@@ -1,0 +1,41 @@
+name: Recipe CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Python syntax
+        run: python -m py_compile scripts/preflight.py
+
+      - name: JSON examples
+        run: python -m json.tool configs/quantization_config.example.json >/dev/null
+
+      - name: Pin integrity
+        run: |
+          grep -q 'vllm/vllm-openai:deepseekv41-flash-0909' Dockerfile.spark
+          grep -q '8f4517e80416466fa4a3ad2eb28685021d39e95f' Dockerfile.spark
+          grep -q 'be57335b087e4f001c5caae061544df3c06ba01e' Dockerfile.spark
+          grep -q 'P2B_MOE_ABI_VERSION' scripts/preflight.py
+
+      - name: Required recipe files
+        run: |
+          test -f docs/TP4.md
+          test -f docs/TP2.md
+          test -f THIRD_PARTY_NOTICES.md
+          test -f AGENTS.md
