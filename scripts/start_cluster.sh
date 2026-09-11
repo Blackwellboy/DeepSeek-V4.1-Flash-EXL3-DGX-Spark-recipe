@@ -28,6 +28,7 @@ DOCKER_ARGS=(
   --ipc host
   --ulimit memlock=-1
   --ulimit stack=67108864
+  --entrypoint ray
   -v "$RECIPE_ROOT:/recipe:ro"
   -v "$HF_HOME:/root/.cache/huggingface"
   -e HF_HOME=/root/.cache/huggingface
@@ -53,13 +54,13 @@ if [[ "$ROLE" == "head" ]]; then
     echo "ERROR: head NODE_IP ($NODE_IP) must equal HEAD_IP ($HEAD_IP)." >&2
     exit 2
   fi
-  RAY_CMD=(ray start --head --node-ip-address="$NODE_IP" --port="$RAY_PORT" --num-gpus=1 --disable-usage-stats --block)
+  RAY_ARGS=(start --head --node-ip-address="$NODE_IP" --port="$RAY_PORT" --num-gpus=1 --disable-usage-stats --block)
 else
-  RAY_CMD=(ray start --address="$HEAD_IP:$RAY_PORT" --node-ip-address="$NODE_IP" --num-gpus=1 --disable-usage-stats --block)
+  RAY_ARGS=(start --address="$HEAD_IP:$RAY_PORT" --node-ip-address="$NODE_IP" --num-gpus=1 --disable-usage-stats --block)
 fi
 
 echo "Starting $ROLE container '$CONTAINER_NAME' on $NODE_IP"
-docker "${DOCKER_ARGS[@]}" "$IMAGE" "${RAY_CMD[@]}"
+docker "${DOCKER_ARGS[@]}" "$IMAGE" "${RAY_ARGS[@]}"
 
 echo "Container started. Recent logs:"
 sleep 2
