@@ -6,17 +6,20 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 BASE_IMAGE="${BASE_IMAGE:-vllm/vllm-openai:deepseekv41-flash-0909}"
 VLLM_EXL3_REF="${VLLM_EXL3_REF:-8f4517e80416466fa4a3ad2eb28685021d39e95f}"
 EXLLAMAV3_REF="${EXLLAMAV3_REF:-be57335b087e4f001c5caae061544df3c06ba01e}"
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 
 echo "Building $IMAGE"
 echo "  base:        $BASE_IMAGE"
 echo "  vllm-exl3:  $VLLM_EXL3_REF"
 echo "  ExLlamaV3:  $EXLLAMAV3_REF"
+echo "  CUDA arch:   $TORCH_CUDA_ARCH_LIST"
 
 docker build \
   -f "$RECIPE_ROOT/Dockerfile.spark" \
   --build-arg BASE_IMAGE="$BASE_IMAGE" \
   --build-arg VLLM_EXL3_REF="$VLLM_EXL3_REF" \
   --build-arg EXLLAMAV3_REF="$EXLLAMAV3_REF" \
+  --build-arg TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   -t "$IMAGE" \
   "$RECIPE_ROOT"
 
