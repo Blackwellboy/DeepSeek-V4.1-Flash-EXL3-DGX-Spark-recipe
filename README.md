@@ -2,7 +2,15 @@
 
 Turnkey serving recipes for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10, with separate **TP2 (2 Spark)** and **TP4 (4 Spark)** paths.
 
-This repository is a runtime/serving recipe. It does not contain model weights and it does not quantize the model. Point `MODEL` at a compatible EXL3 checkpoint produced for the topology you want to test.
+## Hugging Face model
+
+**Default EXL3 checkpoint:** [vcruz305/DSV4.1-Flash-EXL3](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3)
+
+The recipe now uses `vcruz305/DSV4.1-Flash-EXL3` as the default `MODEL` in `.env.example`, so users can clone this repo, copy the example environment file, and start from the public Hugging Face checkpoint without manually entering the model id.
+
+> The Hugging Face model card is the source of truth for conversion/upload status. Do not assume an in-progress upload is a complete loadable checkpoint until the model card says the conversion is complete.
+
+This repository is a runtime/serving recipe. It does not contain model weights and it does not quantize the model. Override `MODEL` when testing a topology-specific or local EXL3 checkpoint.
 
 > **Status:** early hardware qualification. TP4+EP4 is the preferred correctness-first topology. TP2+EP2 is intentionally experimental and requires a sufficiently small EXL3 pack. The ABI-3 native EXL3 MoE path is opt-in until it has full GB10 parity and throughput receipts.
 
@@ -10,6 +18,7 @@ This repository is a runtime/serving recipe. It does not contain model weights a
 
 | Component | Pin |
 |---|---|
+| Default EXL3 checkpoint | `vcruz305/DSV4.1-Flash-EXL3` |
 | DeepSeek V4.1 vLLM image | `vllm/vllm-openai:deepseekv41-flash-0909` |
 | vLLM requirement | 0.30.0+ architecture image; do **not** replace with stock pip vLLM |
 | `vllm-exl3` | `8f4517e80416466fa4a3ad2eb28685021d39e95f` |
@@ -71,10 +80,10 @@ The image layers the pinned EXL3 plugin and ExLlamaV3 onto the dedicated DeepSee
 
 ```bash
 cp .env.example .env
-# Edit .env and set MODEL to your local path or Hugging Face repo id.
+# MODEL already defaults to vcruz305/DSV4.1-Flash-EXL3.
 ```
 
-If `MODEL` is local, set `MODEL_DIR` to a host directory mounted at `/models` on every Spark and set `MODEL=/models/<checkpoint-directory>`. Every node must see identical checkpoint contents.
+To test a different Hugging Face checkpoint, change `MODEL`. If `MODEL` is local, set `MODEL_DIR` to a host directory mounted at `/models` on every Spark and set `MODEL=/models/<checkpoint-directory>`. Every node must see identical checkpoint contents.
 
 ### 3. Start the Ray cluster
 
@@ -169,7 +178,7 @@ The official V4.1 runtime provides the `deepseek_v41` tokenizer mode, tool parse
 Defaults here are intentionally conservative:
 
 - `MAX_MODEL_LEN=65536`
-- `GPU_MEMORY_UTILIZATION=0.90`
+- `GPU_MEMORY_UTILIZATION=0.75`
 - `MAX_NUM_SEQS=4`
 - `MAX_NUM_BATCHED_TOKENS=4096`
 - `TEXT_ONLY=1`
