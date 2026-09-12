@@ -32,10 +32,10 @@ The older [`vcruz305/DSV4.1-Flash-EXL3`](https://huggingface.co/vcruz305/DSV4.1-
 Current plugin pin:
 
 ```text
-vllm-exl3: 3ce1ae08f3e4a9545c58d5ac6456807c702d524a
+vllm-exl3: ee8c2c171bbe0d036a3accb24a76af5a95506748
 ```
 
-That includes the GB10 setuptools>=77 build fix and opt-in coordinate-preserving diagnostic shape-mismatch mode from PR #9 by @fattchris. Shape mismatch still **hard-fails by default**.
+That history includes the GB10 setuptools>=77 build fix and opt-in coordinate-preserving diagnostic shape-mismatch mode from PR #9 by @fattchris. Shape mismatch still **hard-fails by default**. The current pin also resolves TP/EP weight geometry from `RoutedExperts.moe_config.moe_parallel_config` before any process-wide TP fallback, so EP layouts with MoE TP=1 keep whole expert matrices.
 
 The locked runtime reports:
 
@@ -45,6 +45,7 @@ ExLlamaV3 MoE kernel family:   K1-K8
 custom native p2b:             K2-K4 only
 routed allocation:             one K per RoutedExperts transformer layer
 tensor-level mixed K in layer: not currently supported
+TP/EP geometry source:          per-MoE config before process TP
 ```
 
 ## Architecture
@@ -71,7 +72,7 @@ cd DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe
 cp .env.example .env
 ```
 
-`.env.example` is now the safe **8K / seq1 / text-only / eager / DSpark-off / native-off** first-boot profile. Larger contexts are explicit qualification steps, not defaults.
+`.env.example` is the safe **8K / seq1 / text-only / eager / DSpark-off / native-off** first-boot profile. Larger contexts are explicit qualification steps, not defaults.
 
 ### 2. Host doctor
 
@@ -85,7 +86,27 @@ bash scripts/doctor.sh 2
 
 The doctor checks Docker, NVIDIA visibility, host architecture, filesystem headroom, RDMA discovery, local image state and—when a local model is supplied—the physical checkpoint contract.
 
-### 3. Build the locked runtime
+### 3. Probe the remote HF layout without downloading weights
+
+Before moving hundreds of GiB, inspect only `config.json`, the index, and safetensors header byte ranges:
+
+```bash
+python3 scripts/probe_remote_pack.py --tp 4
+# or
+python3 scripts/probe_remote_pack.py --tp 2
+```
+
+The probe requires HTTP `206 Partial Content` for shard reads and aborts if a server ignores `Range`, so it cannot silently become a full-shard download. It checks remote shard/index membership, offset bounds, known dtype/shape byte counts, EXL3 K geometry and within-layer mixed K.
+
+A compatible layout reports:
+
+```text
+REMOTE_LAYOUT_COMPATIBLE=YES
+```
+
+This is a layout gate only; local integrity validation remains required.
+
+### 4. Build the locked runtime
 
 ```bash
 bash scripts/build_runtime.sh
@@ -97,9 +118,9 @@ Build inputs come from `runtime.lock.json`. Experimental overrides require:
 ALLOW_RUNTIME_OVERRIDE=1 ... bash scripts/build_runtime.sh
 ```
 
-The Dockerfile includes GB10 fixes contributed and hardware-tested by @fattchris: conditional `python` alias creation, dynamic cuSPARSE header discovery, configurable `VLLM_EXL3_REPO`, and the merged plugin SHA.
+The Dockerfile includes GB10 fixes contributed and hardware-tested by @fattchris: conditional `python` alias creation, dynamic cuSPARSE header discovery, configurable `VLLM_EXL3_REPO`, and the merged plugin fixes.
 
-### 4. Materialize a model onto a large filesystem
+### 5. Materialize a model onto a large filesystem
 
 TP4:
 
@@ -119,7 +140,7 @@ The generic materializer keeps `HF_HOME`, Hub cache and Xet cache on the same la
 
 Current TP4/TP2 artifacts are source/qualification artifacts rather than declared vLLM-deployable packs, so downloading them for compatibility work is deliberately explicit.
 
-### 5. Validate a local pack
+### 6. Validate a local pack
 
 ```bash
 python3 scripts/validate_pack.py \
@@ -159,7 +180,7 @@ DEPLOYABLE_CURRENT_LOADER=YES
 
 before treating a pack as deployment-ready.
 
-### 6. Start Ray
+### 7. Start Ray
 
 `ENABLE_RDMA=auto` is the default. It maps `/dev/infiniband` only when present. `ENABLE_RDMA=1` requires it and hard-fails if missing; `ENABLE_RDMA=0` leaves network selection to NCCL/Gloo.
 
@@ -179,7 +200,7 @@ An existing container is **not deleted automatically**. Intentional replacement 
 
 TP4 needs three workers; TP2 needs one.
 
-### 7. Preflight the exact runtime
+### 8. Preflight runtime identity **and** a real GPU collective
 
 ```bash
 bash scripts/preflight.sh 4
@@ -187,9 +208,17 @@ bash scripts/preflight.sh 4
 bash scripts/preflight.sh 2
 ```
 
-Preflight verifies the locked plugin/ExLlama revisions and ABI on every live Ray node. For a mounted local checkpoint it also runs the physical pack validator.
+Preflight verifies the locked plugin/ExLlama revisions and ABI on every live Ray node. For a mounted local checkpoint it also runs the physical pack validator. It then pins one Ray GPU task to each selected node and performs a real NCCL all-reduce, verifying both numerical parity and cross-node transport before any model load.
 
-### 8. First serve
+The collective can be run independently:
+
+```bash
+bash scripts/cluster_collective.sh 4
+```
+
+`SKIP_NCCL_COLLECTIVE=1` exists for targeted debugging only; a skipped collective is not a fully qualified distributed deployment.
+
+### 9. First serve
 
 TP4:
 
@@ -205,13 +234,13 @@ bash scripts/serve_tp2.sh
 
 Both wrappers fail closed on remote/unvalidated source artifacts unless an explicit loader-development bypass is set.
 
-### 9. Deterministic smoke test
+### 10. Deterministic smoke test
 
 ```bash
 bash scripts/smoke_test.sh
 ```
 
-The smoke test now fails unless `/v1/models` exposes the expected served model **and** the deterministic response content is exactly:
+The smoke test fails unless `/v1/models` exposes the expected served model **and** the deterministic response content is exactly:
 
 ```text
 EXL3 Spark OK
@@ -221,7 +250,7 @@ Pretty-printing a fluent but wrong response no longer counts as a pass.
 
 ## TP4 qualification
 
-The published 4.75-bpw pack is complete on HF, but its card explicitly describes **mixed K per tensor**. Current vLLM routed allocation remains one K per transformer layer. Therefore TP4 must pass `validate_pack.py --topology tp4` before runtime qualification.
+The published 4.75-bpw pack is complete on HF, but its card explicitly describes **mixed K per tensor**. Current vLLM routed allocation remains one K per transformer layer. Therefore TP4 must pass the remote/local layout gates before runtime qualification.
 
 Once a compatible TP4 pack exists, use:
 
@@ -286,6 +315,7 @@ Do not use the short Docker image ID alone to prove cross-node identity on Docke
 
 ## Useful docs
 
+- [`docs/VALIDATION.md`](docs/VALIDATION.md)
 - [`docs/TP4.md`](docs/TP4.md)
 - [`docs/TP2.md`](docs/TP2.md)
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)
