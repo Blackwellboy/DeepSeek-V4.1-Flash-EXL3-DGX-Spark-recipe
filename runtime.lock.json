@@ -1,0 +1,52 @@
+{
+  "schema": "dsv41-exl3-runtime-lock.v1",
+  "generated_at": "2026-09-12T18:39:00Z",
+  "base_image": {
+    "ref": "vllm/vllm-openai:deepseekv41-flash-0909",
+    "digest": null,
+    "note": "Digest should be captured after a known-good build and then pinned here. Until then the tag is the authoritative recipe input."
+  },
+  "vllm_exl3": {
+    "repo": "https://github.com/vcruz305/vllm-exl3.git",
+    "commit": "21fa627a3933d80de2d1030e732354d8c3cd761e"
+  },
+  "exllamav3": {
+    "repo": "https://github.com/turboderp-org/exllamav3.git",
+    "commit": "be57335b087e4f001c5caae061544df3c06ba01e"
+  },
+  "native_abi_min": 3,
+  "torch_cuda_arch_list": "12.1a",
+  "capabilities": {
+    "accepted_exl3_config_k": [2, 3, 4, 5, 6, 7, 8],
+    "exllamav3_moe_kernel_k": [1, 2, 3, 4, 5, 6, 7, 8],
+    "native_p2b_k": [2, 3, 4],
+    "routed_allocation_scope": "one_k_per_routedexperts_transformer_layer",
+    "tensor_level_mixed_k_within_layer": false
+  },
+  "models": {
+    "tp4": {
+      "repo_id": "vcruz305/DSV4.1-Flash-EXL3-4.75bpw",
+      "revision": "e971fd5",
+      "expected_shards": 32,
+      "status": "source_artifact_pending_vllm_layout_validation",
+      "required_loader_contract": "layer_uniform_routed_k"
+    },
+    "tp2": {
+      "repo_id": "vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw",
+      "revision": null,
+      "expected_shards": null,
+      "status": "quarantined_source_artifact",
+      "required_loader_contract": "layer_uniform_routed_k"
+    }
+  },
+  "first_boot": {
+    "max_model_len": 8192,
+    "gpu_memory_utilization": 0.75,
+    "max_num_seqs": 1,
+    "max_num_batched_tokens": 1024,
+    "text_only": true,
+    "dspark": false,
+    "eager": true,
+    "native_moe": false
+  }
+}
