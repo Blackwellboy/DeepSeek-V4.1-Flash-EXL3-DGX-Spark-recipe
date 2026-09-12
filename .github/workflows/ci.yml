@@ -21,7 +21,10 @@ jobs:
         run: bash -n scripts/*.sh
 
       - name: Python syntax
-        run: python -m py_compile scripts/preflight.py
+        run: |
+          for f in scripts/*.py; do
+            python -m py_compile "$f"
+          done
 
       - name: JSON examples
         run: python -m json.tool configs/quantization_config.example.json >/dev/null
@@ -32,10 +35,24 @@ jobs:
           grep -q '8f4517e80416466fa4a3ad2eb28685021d39e95f' Dockerfile.spark
           grep -q 'be57335b087e4f001c5caae061544df3c06ba01e' Dockerfile.spark
           grep -q 'P2B_MOE_ABI_VERSION' scripts/preflight.py
+          grep -q 'vcruz305/DSV4.1-Flash-EXL3-4.75bpw' .env.example
+          grep -q 'vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw' .env.example
+
+      - name: Qualification harness integrity
+        run: |
+          grep -q 'MAX_MODEL_LEN=8192' scripts/tp4_min_fit.sh
+          grep -q 'MAX_NUM_SEQS=1' scripts/tp4_min_fit.sh
+          grep -q 'NATIVE_MOE=0' scripts/tp4_min_fit.sh
+          grep -q 'DRY_RUN' scripts/serve.sh
+          grep -q '_EXPLICIT_ENV' scripts/lib.sh
 
       - name: Required recipe files
         run: |
           test -f docs/TP4.md
           test -f docs/TP2.md
+          test -f docs/TROUBLESHOOTING.md
+          test -f scripts/tp4_min_fit.sh
+          test -f scripts/watch_ray_memory.py
+          test -f scripts/image_fingerprint.sh
           test -f THIRD_PARTY_NOTICES.md
           test -f AGENTS.md
