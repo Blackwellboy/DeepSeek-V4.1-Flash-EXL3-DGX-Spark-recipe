@@ -32,4 +32,4 @@ jobs:
           python -m json.tool runtime.lock.json >/dev/null
 
       - name: Runtime and deployment contract tests
-        run: python tests/test_recipe_contract.py
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
