@@ -1,10 +1,12 @@
 # TP2 + EP2: two DGX Sparks
 
-TP2 is the aggressive target. Treat it as a separate checkpoint/memory problem rather than a smaller copy of TP4.
+TP2 is the aggressive target. Treat it as a separate checkpoint, storage, loader, and memory problem rather than a smaller copy of TP4.
 
-**Published TP2 checkpoint:** [`vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw)
+**Current SAGE source artifact:** [`vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw)
 
-With `MODEL=` left blank, `scripts/preflight.sh 2` and `scripts/serve_tp2.sh` select that repo through `MODEL_TP2` automatically.
+> **Deployment status:** the currently published 3.30-bpw snapshot is **not yet the recommended direct vLLM TP2 deployment pack**. A lab campaign reported invalid/unmaterialized shard headers and tensor-level mixed K2-K8. Current `vllm-exl3` now accepts K2-K8 configuration values, but routed-MoE allocation still requires **one K per transformer layer**. The existing tensor-mixed snapshot must be validated and, where needed, repacked/re-encoded to the layer-uniform compatibility contract before deployment.
+
+`serve_tp2.sh` therefore fails closed on a remote/unvalidated model by default.
 
 ## Geometry
 
@@ -17,93 +19,135 @@ With `MODEL=` left blank, `scripts/preflight.sh 2` and `scripts/serve_tp2.sh` se
 
 The dimensions are 128-aligned, but 192 local experts exceed the current ExLlamaV3 fused-MoE 128-expert envelope.
 
-## The 4.75-bpw TP4 pack is not the recommended TP2 pack
+## Recovery step 1: materialize the checkpoint correctly
 
-If the full checkpoint is approximately **422 GiB** on disk because it contains about **189 GiB of Engram/PLE** plus about **233 GiB of non-PLE model body**, putting Engram/PLE on NVMe changes the TP2 capacity math to the model body only:
+Do **not** use a plain `git clone` as proof that Hugging Face model weights are present. Hugging Face Xet-backed Git repositories remain compatible with Git LFS pointer files, so a checkout can contain tiny pointer stubs instead of the safetensors payloads if the large-object transport was not materialized.
 
-- TP4 + disk PLE: ~233 / 4 = **58.25 GiB model body per Spark**
-- TP2 + disk PLE: ~233 / 2 = **116.5 GiB model body per Spark**
-
-A GB10 has 128 GB coherent unified system memory and commonly exposes roughly 121-122 GiB to CUDA. CPU, GPU, the OS, page cache and runtime all share that physical pool. Therefore ~116.5 GiB/rank leaves effectively no usable space for vLLM workspaces, sparse-attention/indexer state, CUDA graphs, KV cache, Ray, DSpark or ordinary OS headroom.
-
-The same 4.75-bpw pack can remain a diagnostic/bring-up attempt, but it should **not** be advertised as the normal TP2 recipe.
-
-## TP2 quantization target
-
-The published TP2 pack is a separate **SAGE 3.30-bpw** target rather than the TP4 4.75-bpw release. The important qualification number is still the **final non-PLE body bytes**, not the nominal average bpw alone.
-
-Earlier planning targeted roughly:
-
-- **goal: 170-175 GiB total non-PLE body**
-- per Spark under TP2: **85-87.5 GiB/rank**
-- stretch ceiling for early experiments: about **180 GiB body / 90 GiB per rank**
-
-Measure the published 3.30-bpw checkpoint directly before claiming those exact body numbers. Dense MXFP8 weights, embeddings, scales and other fixed-format tensors do not scale linearly with routed-expert EXL3 bitrate.
-
-## CPU offload on DGX Spark
-
-Do **not** rely on `--cpu-offload-gb` as the TP2 capacity solution.
-
-On a normal discrete-GPU server, vLLM CPU offload can increase effective GPU capacity because GPU VRAM and host RAM are separate physical pools. DGX Spark is different: Grace CPU and Blackwell GPU share the same 128 GB LPDDR5x coherent unified memory. vLLM's UVA offloader places parameters in pinned CPU memory and exposes accelerator views, but those pages still consume the same physical Spark memory pool.
-
-CPU/UVA offload may still be useful as an experimental access-policy or allocator test, but it does **not** turn a too-large per-rank checkpoint into a comfortably sized TP2 deployment. It is disabled in this recipe by default.
-
-The useful capacity offload for V4.1 on Spark is **NVMe-backed data that is not kept resident**, especially the ~189 GiB Engram/PLE tables. Any additional NVMe/layer streaming variant must be documented and benchmarked separately because it can materially change latency and prefill throughput.
-
-## Checkpoint requirement
-
-Before serving, measure actual per-rank residency including:
-
-- EXL3 main routed experts;
-- source-format DSpark experts;
-- source MXFP8 dense/attention/router weights;
-- embedding/lm head;
-- Engram tables or their chosen backing strategy;
-- quantization metadata/scales;
-- runtime workspaces and CUDA graphs;
-- KV cache.
-
-Do not advertise a two-Spark fit from weight size alone.
-
-## First boot
-
-The TP2 wrapper defaults to `NATIVE_MOE=1` because ABI-3 p2b can represent 5120 x 2304 and does not use the ExLlamaV3 128-local-expert fused ceiling.
-
-Start conservative:
+Use a filesystem with substantial free space:
 
 ```bash
-GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 TEXT_ONLY=1 bash scripts/serve_tp2.sh
+bash scripts/materialize_tp2.sh /large/models/DSV4.1-Flash-SAGE-EXL3-TP2
 ```
 
-This is still **experimental** until the full V4.1 geometry passes GB10 numerical parity and real-checkpoint serving.
+The helper uses `hf download`, `huggingface-cli`, or `huggingface_hub.snapshot_download`, then runs the TP2 pack checker.
 
-For a conservative fallback/control attempt:
+The default pre-download free-space gate is intentionally conservative (`TP2_DOWNLOAD_MIN_FREE_GIB=500`). Override it only after measuring the exact snapshot plus Docker/build/cache staging requirements.
+
+If a Spark root filesystem is short by ~60 GB, move the model snapshot/cache to a larger NVMe/shared mount. Freeing enough space to finish a download does **not** solve loader or unified-memory compatibility by itself.
+
+## Recovery step 2: validate shards and K geometry
+
+Run:
 
 ```bash
-NATIVE_MOE=0 GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 bash scripts/serve_tp2.sh
+python3 scripts/check_tp2_pack.py \
+  /large/models/DSV4.1-Flash-SAGE-EXL3-TP2 \
+  --reserve-gib 32
 ```
 
-With native disabled, the plugin may fall back to a slower applicable path. That is useful for correctness comparison but not a performance target.
+The checker reads only safetensors headers and reports:
+
+- indexed shard count and missing shards;
+- Git LFS/Xet-compatible pointer stubs;
+- HTML/XML downloads accidentally saved as shard files;
+- truncated/invalid safetensors headers;
+- EXL3 trellis K histogram inferred from `shape[-1] / 16`;
+- transformer layers containing more than one K;
+- materialized shard bytes;
+- filesystem free space/reserve;
+- `DEPLOYABLE_CURRENT_LOADER=YES|NO`.
+
+If the reported “29 of 31 invalid shards” are pointer stubs, re-materialization may fix that blocker without re-quantizing. If they are genuinely truncated or invalid payloads after a proper HF materialization, the affected files need to be re-uploaded/repacked; the recipe cannot repair corrupted model bytes.
+
+## Recovery step 3: make SAGE mixed K compatible with current vLLM
+
+The current vLLM integration supports mixed precision **between transformer layers**, but one `RoutedExperts` layer currently allocates one trellis K width for all of its routed expert projections.
+
+`vllm-exl3` pinned by this recipe now accepts config K2-K8:
+
+- K2-K4 may use qualified native paths where all other gates pass;
+- K5-K8 use generic ExLlamaV3/LinearEXL3 fallback;
+- tensor-level mixed K inside one routed layer remains unsupported.
+
+The fastest compatibility path is therefore **not** global uniform K. Instead, coalesce the exact SAGE tensor-level recipe to one K per transformer layer while preserving K2-K8 variation across the 40 layers:
+
+```bash
+python tools/coalesce_v41_vllm_recipe.py \
+  /path/to/exact-tp2-sage-recipe.yaml \
+  --out recipes/recipe-tp2-vllm-layer-uniform.yaml \
+  --min-k 2 \
+  --max-k 8
+```
+
+That tool lives in `vcruz305/SAGE-EXL3`. It chooses layer K values nearest the original SAGE allocation and writes a compatibility summary. Because V4.1 routed layers have equal routed-expert tensor geometry, the aggregate average K can be preserved on roughly a 0.025-K grid.
+
+**A metadata edit is not enough.** Any tensor whose selected K changes must be re-encoded. Use the SAGE encode bank to reuse exact `(tensor key, K)` variants and encode only missing deltas, then repack and rerun release/fidelity validation.
+
+See `SAGE-EXL3/docs/V41_VLLM_TP2_COMPAT.md`.
+
+## Memory contract: streamed/nonresident Engram
+
+TP2 should not be qualified with resident Engram as if it were a smaller TP4 run. The SAGE TP2 direction is explicitly **streamed/nonresident Engram/PLE**.
+
+The 4.75-bpw TP4 body is also not the normal TP2 pack. With about 233 GiB of non-PLE body, TP2 would place roughly **116.5 GiB body per Spark** before runtime/KV/workspaces, which is not a practical operating point in GB10's shared 128 GB physical memory pool.
+
+The TP2 SAGE build exists to reduce the body substantially, but the actual corrected repack must be measured after encoding. Do not infer runtime fit solely from the nominal 3.30 bpw name.
+
+CPU/UVA offload does not create a second physical memory pool on DGX Spark. Grace CPU and Blackwell GPU share the same LPDDR5x. It may alter access/placement behavior, but it is not a replacement for a genuinely smaller body plus nonresident Engram.
+
+## Safe TP2 deployment sequence
+
+Until a corrected layer-uniform vLLM pack is published, use the current HF repo only as a recovery/source artifact.
+
+After a corrected snapshot exists:
+
+1. materialize it on a sufficiently large mount on both Sparks;
+2. run `check_tp2_pack.py` and require zero bad shards and zero mixed-K layers;
+3. build the pinned recipe image with K2-K8-capable `vllm-exl3`;
+4. start text-only, eager, batch/seq 1, DSpark off;
+5. prove 8K first;
+6. then 32K;
+7. then 64K;
+8. attempt 128K **only with measured unified-memory headroom**.
+
+128K is currently **unverified** and must not be advertised as working.
+
+## Launch gate
+
+With a validated local snapshot mounted at `/models/...`, the normal wrapper runs the checker inside the head container before vLLM launch:
+
+```bash
+MODEL_DIR=/large/models \
+MODEL=/models/DSV4.1-Flash-SAGE-EXL3-TP2-vllm \
+GPU_MEMORY_UTILIZATION=0.75 \
+MAX_MODEL_LEN=8192 \
+MAX_NUM_SEQS=1 \
+DSPARK=0 \
+EAGER=1 \
+TEXT_ONLY=1 \
+bash scripts/serve_tp2.sh
+```
+
+`TP2_ALLOW_UNVALIDATED=1` exists only for loader-development experiments. It is not a deployment recommendation and should never be used for benchmark claims.
 
 ## Qualification gates
 
 Before calling TP2 usable, retain evidence for:
 
-1. checkpoint preflight and ABI 3;
-2. Ray sees exactly/at least two GPUs;
-3. each rank owns 192 main experts;
-4. deterministic output parity against a known-good V4.1 baseline;
-5. no OOM during load and first generation;
-6. repeated decode stability;
-7. per-rank unified-memory high-water mark;
-8. actual EXL3 backend dispatch;
-9. 64K context stability;
-10. DSpark only after the non-speculative baseline is stable.
-
-## Engram warning
-
-Source V4.1 Engram is enormous relative to a two-Spark memory budget. A successful TP2 recipe requires the Engram/PLE tables to remain non-resident or use another explicitly documented backing strategy. Do not hide that modification inside the EXL3 recipe; report its latency/prefill impact.
+1. fully materialized and valid safetensors shards;
+2. compatible layer-uniform K2-K8 routed layout;
+3. checkpoint/repack provenance and exact plugin revision;
+4. Ray sees both GPUs;
+5. each rank owns 192 main experts;
+6. streamed/nonresident Engram behavior is active and identified;
+7. deterministic output parity against a known-good V4.1 baseline;
+8. no OOM during load and first generation;
+9. repeated decode stability;
+10. per-rank unified-memory high-water mark;
+11. actual EXL3 backend dispatch;
+12. context progression with 128K still treated as unverified until measured;
+13. DSpark only after the non-speculative baseline is stable.
 
 ## Performance reporting
 
-Report both per-request decode speed and aggregate throughput. A two-node result is only comparable to TP4 when the checkpoint revision, K schedule, context, prompt, output length, DSpark policy, graph mode and sampling are identical.
+Report both per-request decode speed and aggregate throughput. A two-node result is only comparable to TP4 when checkpoint identity, K schedule, Engram strategy, context, prompt, output length, DSpark policy, graph mode and sampling are all recorded.
