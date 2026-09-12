@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Preflight a DeepSeek-V4.1 EXL3 checkpoint and every active Spark runtime node."""
-
 from __future__ import annotations
 
 import argparse
@@ -12,9 +11,8 @@ import subprocess
 import sys
 from typing import Any
 
-EXPECTED_VLLM_EXL3 = "8f4517e80416466fa4a3ad2eb28685021d39e95f"
-EXPECTED_EXLLAMAV3 = "be57335b087e4f001c5caae061544df3c06ba01e"
-EXPECTED_ABI = 3
+from runtime_lock import load_lock
+from validate_pack import validate_pack
 
 
 def git_head(path: str) -> str | None:
@@ -50,7 +48,15 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision", default="")
     parser.add_argument("--tp", type=int, choices=(2, 4), required=True)
+    parser.add_argument("--pack-reserve-gib", type=float, default=32.0)
     args = parser.parse_args()
+
+    lock = load_lock()
+    expected_plugin = str(lock["vllm_exl3"]["commit"])
+    expected_exllama = str(lock["exllamav3"]["commit"])
+    expected_abi = int(lock["native_abi_min"])
+    topology = f"tp{args.tp}"
+    model_lock = lock["models"][topology]
 
     issues: list[str] = []
     warnings: list[str] = []
@@ -65,12 +71,18 @@ def main() -> int:
     diagnostics = vllm_exl3.runtime_diagnostics()
     plan = plan_deepseek_v41(tensor_parallel_size=args.tp, expert_parallel=True).to_dict()
 
+    locked_repo = str(model_lock.get("repo_id") or "")
+    locked_revision = str(model_lock.get("revision") or "")
+    if args.model == locked_repo and locked_revision and args.revision != locked_revision:
+        issues.append(
+            f"canonical {topology} model must use locked revision {locked_revision}; got {args.revision or '<main>'}"
+        )
+
     config, config_source = load_model_config(args.model, args.revision or None)
     quant = config.get("quantization_config")
     if not isinstance(quant, dict):
         quant = {}
         issues.append("config.json has no quantization_config object")
-
     if str(quant.get("quant_method", "")).lower() != "exl3":
         issues.append("quantization_config.quant_method must be 'exl3'")
 
@@ -78,7 +90,6 @@ def main() -> int:
     if not isinstance(source, dict):
         source = {}
         issues.append("non_routed_quantization is missing")
-
     if str(source.get("quant_method", "")).lower() != "deepseek_v4_fp8":
         issues.append("non_routed_quantization.quant_method must be deepseek_v4_fp8")
     if source.get("weight_block_size") != [32, 32]:
@@ -88,9 +99,7 @@ def main() -> int:
 
     codebook = str(quant.get("codebook", "mcg")).lower()
     if codebook != "mcg":
-        warnings.append(
-            f"codebook={codebook!r}; the ABI-3 native p2b path currently expects MCG"
-        )
+        warnings.append(f"codebook={codebook!r}; custom native p2b remains MCG-only")
 
     architectures = config.get("architectures") or []
     model_type = str(config.get("model_type", ""))
@@ -102,15 +111,38 @@ def main() -> int:
             f"model identity does not look like DeepSeek V4.1: model_type={model_type!r}, architectures={architectures!r}"
         )
 
+    model_path = Path(args.model).expanduser()
+    physical_pack: dict[str, Any] | None = None
+    if model_path.is_dir():
+        physical_pack = validate_pack(model_path, topology, args.pack_reserve_gib)
+        if not physical_pack["deployable_with_current_pinned_loader"]:
+            issues.extend(f"pack: {item}" for item in physical_pack["errors"])
+        warnings.extend(f"pack: {item}" for item in physical_pack["warnings"])
+    else:
+        warnings.append(
+            "remote model id: physical shard/K/index validation was not run; materialize locally before claiming deployment readiness"
+        )
+
     abi = int(getattr(vllm_exl3_c, "P2B_MOE_ABI_VERSION", 0))
     local_plugin = git_head("/opt/vllm-exl3")
     local_exllama = git_head("/opt/exllamav3")
-    if abi < EXPECTED_ABI:
-        issues.append(f"vllm_exl3_c ABI {abi} is stale; recipe requires ABI >= {EXPECTED_ABI}")
-    if local_plugin != EXPECTED_VLLM_EXL3:
-        issues.append(f"head vllm-exl3 revision is {local_plugin}, expected {EXPECTED_VLLM_EXL3}")
-    if local_exllama != EXPECTED_EXLLAMAV3:
-        issues.append(f"head ExLlamaV3 revision is {local_exllama}, expected {EXPECTED_EXLLAMAV3}")
+    if abi < expected_abi:
+        issues.append(f"vllm_exl3_c ABI {abi} is stale; runtime lock requires ABI >= {expected_abi}")
+    if local_plugin != expected_plugin:
+        issues.append(f"head vllm-exl3 revision is {local_plugin}, expected {expected_plugin}")
+    if local_exllama != expected_exllama:
+        issues.append(f"head ExLlamaV3 revision is {local_exllama}, expected {expected_exllama}")
+
+    mixed_diag = diagnostics.get("mixed_k", {}) if isinstance(diagnostics, dict) else {}
+    locked_caps = lock["capabilities"]
+    if mixed_diag.get("config_bits") != locked_caps["accepted_exl3_config_k"]:
+        issues.append(
+            f"runtime accepted EXL3 K {mixed_diag.get('config_bits')} != lock {locked_caps['accepted_exl3_config_k']}"
+        )
+    if bool(mixed_diag.get("tensor_level_mixed_k_within_layer")) != bool(
+        locked_caps["tensor_level_mixed_k_within_layer"]
+    ):
+        issues.append("runtime tensor-level mixed-K capability differs from runtime lock")
 
     capability = None
     gpu_name = None
@@ -138,6 +170,7 @@ def main() -> int:
         def node_identity() -> dict[str, Any]:
             import subprocess as _subprocess
             import socket as _socket
+            import torch as _torch
             import vllm as _vllm
             import vllm_exl3_c as _native
 
@@ -157,6 +190,8 @@ def main() -> int:
                 "vllm_exl3_git": _head("/opt/vllm-exl3"),
                 "exllamav3_git": _head("/opt/exllamav3"),
                 "native_abi": int(getattr(_native, "P2B_MOE_ABI_VERSION", 0)),
+                "gpu_name": _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else None,
+                "cuda_capability": list(_torch.cuda.get_device_capability(0)) if _torch.cuda.is_available() else None,
             }
 
         alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
@@ -171,34 +206,35 @@ def main() -> int:
 
         for ident in node_identities:
             label = ident.get("hostname") or ident.get("node_id")
-            if ident.get("vllm_exl3_git") != EXPECTED_VLLM_EXL3:
+            if ident.get("vllm_exl3_git") != expected_plugin:
                 issues.append(
-                    f"node {label} has vllm-exl3 {ident.get('vllm_exl3_git')}, expected {EXPECTED_VLLM_EXL3}"
+                    f"node {label} has vllm-exl3 {ident.get('vllm_exl3_git')}, expected {expected_plugin}"
                 )
-            if ident.get("exllamav3_git") != EXPECTED_EXLLAMAV3:
+            if ident.get("exllamav3_git") != expected_exllama:
                 issues.append(
-                    f"node {label} has ExLlamaV3 {ident.get('exllamav3_git')}, expected {EXPECTED_EXLLAMAV3}"
+                    f"node {label} has ExLlamaV3 {ident.get('exllamav3_git')}, expected {expected_exllama}"
                 )
-            if int(ident.get("native_abi") or 0) < EXPECTED_ABI:
-                issues.append(f"node {label} has native ABI {ident.get('native_abi')}, expected >= {EXPECTED_ABI}")
+            if int(ident.get("native_abi") or 0) < expected_abi:
+                issues.append(f"node {label} has native ABI {ident.get('native_abi')}, expected >= {expected_abi}")
     except Exception as exc:
         issues.append(f"could not inspect Ray cluster: {exc}")
 
-    if args.tp == 2:
-        warnings.append(
-            "TP2 owns 192 full experts per rank; this exceeds the current ExLlamaV3 fused 128-expert envelope. "
-            "Treat ABI-3 native p2b as experimental and verify pack memory separately."
+    if plan.get("preferred_first_boot_backend") != "exllamav3":
+        issues.append(
+            f"planner reports first-boot backend {plan.get('preferred_first_boot_backend')!r}; locked recipe expects exllamav3"
         )
 
     report = {
         "ok": not issues,
         "issues": issues,
         "warnings": warnings,
+        "runtime_lock": lock,
         "model": args.model,
         "revision": args.revision or None,
         "config_source": config_source,
         "model_type": model_type,
         "architectures": architectures,
+        "physical_pack": physical_pack,
         "quantization": {
             "quant_method": quant.get("quant_method"),
             "bits": quant.get("bits"),
