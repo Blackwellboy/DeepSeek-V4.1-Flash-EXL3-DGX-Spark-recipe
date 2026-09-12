@@ -4,6 +4,12 @@
 The validator reads safetensors headers only. It is intentionally independent of
 vLLM model loading so malformed or incompatible ~400 GiB checkpoints fail before
 cluster startup or weight allocation.
+
+Generic/local validation checks loader compatibility and structural integrity.
+Canonical Hugging Face snapshot validation can additionally require the exact
+locked shard count via ``--strict-locked-snapshot``. This distinction matters
+because a corrected/repacked local checkpoint may legitimately use a different
+number of safetensors shards while remaining fully loader-compatible.
 """
 from __future__ import annotations
 
@@ -110,7 +116,13 @@ def expected_tensor_bytes(meta: dict[str, Any]) -> int | None:
     return count * itemsize
 
 
-def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[str, Any]:
+def validate_pack(
+    model_dir: Path,
+    topology: str,
+    reserve_gib: float,
+    *,
+    strict_locked_snapshot: bool = False,
+) -> dict[str, Any]:
     lock = load_lock()
     root = model_dir.expanduser().resolve()
     tp_key = "tp4" if topology == "tp4" else "tp2"
@@ -127,6 +139,7 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
         "runtime_lock_schema": lock["schema"],
         "required_loader_contract": model_contract["required_loader_contract"],
         "reserve_gib": reserve_gib,
+        "strict_locked_snapshot": bool(strict_locked_snapshot),
         "errors": [],
         "warnings": [],
     }
@@ -186,9 +199,14 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
 
     expected_shards = model_contract.get("expected_shards")
     if expected_shards is not None and len(shards) != int(expected_shards):
-        errors.append(
-            f"index references {len(shards)} shards; runtime lock expects {expected_shards} for {topology}"
+        message = (
+            f"index references {len(shards)} shards; runtime lock expects "
+            f"{expected_shards} for the canonical {topology} snapshot"
         )
+        if strict_locked_snapshot:
+            errors.append(message)
+        else:
+            warnings.append(message + "; allowed for a local/repacked checkpoint")
 
     statuses: Counter[str] = Counter()
     bad_shards: list[dict[str, str]] = []
@@ -297,6 +315,7 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
         {
             "index_tensor_count": len(weight_map),
             "index_shard_count": len(shards),
+            "expected_locked_snapshot_shards": expected_shards,
             "shard_status": dict(sorted(statuses.items())),
             "bad_shards": bad_shards,
             "missing_index_tensors": missing_index_tensors,
@@ -353,10 +372,23 @@ def main() -> int:
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--topology", choices=("tp2", "tp4"), required=True)
     parser.add_argument("--reserve-gib", type=float, default=32.0)
+    parser.add_argument(
+        "--strict-locked-snapshot",
+        action="store_true",
+        help=(
+            "require canonical locked-snapshot metadata such as exact shard count; "
+            "use for materialized HF releases, not arbitrary local repacks"
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    result = validate_pack(args.model_dir, args.topology, args.reserve_gib)
+    result = validate_pack(
+        args.model_dir,
+        args.topology,
+        args.reserve_gib,
+        strict_locked_snapshot=args.strict_locked_snapshot,
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
