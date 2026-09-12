@@ -101,9 +101,10 @@ PY
 fi
 
 echo
-echo "Validating physical checkpoint contract..."
+echo "Validating physical checkpoint contract and locked snapshot identity..."
 python3 "$RECIPE_ROOT/scripts/validate_pack.py" \
-  "$DEST" --topology "$TOPOLOGY" --reserve-gib "$POST_RESERVE_GIB"
+  "$DEST" --topology "$TOPOLOGY" --reserve-gib "$POST_RESERVE_GIB" \
+  --strict-locked-snapshot
 
 echo
 echo "Materialized and validated: $DEST"
