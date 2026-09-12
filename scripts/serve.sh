@@ -9,6 +9,8 @@ if [[ "$TP" != "2" && "$TP" != "4" ]]; then
   exit 2
 fi
 
+MODEL="$(resolve_model_for_tp "$TP")"
+export MODEL
 require_env MODEL
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
@@ -32,6 +34,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 TEXT_ONLY="${TEXT_ONLY:-1}"
 DSPARK="${DSPARK:-0}"
 EAGER="${EAGER:-1}"
+DRY_RUN="${DRY_RUN:-0}"
 
 # Topology default: TP4 starts from the ExLlamaV3 control. TP2 starts from the
 # ABI-3 native candidate because 192 local experts exceed the current
@@ -123,12 +126,20 @@ DSpark:                 $DSPARK
 Eager:                  $EAGER
 Text only:              $TEXT_ONLY
 Max model len:          $MAX_MODEL_LEN
+Max num seqs:           $MAX_NUM_SEQS
+Max batched tokens:     $MAX_NUM_BATCHED_TOKENS
 GPU memory utilization: $GPU_MEMORY_UTILIZATION
+Dry run:                $DRY_RUN
 EOF
 
 echo
 printf 'Command:'
 printf ' %q' "${ARGS[@]}"
 echo
+
+if is_true "$DRY_RUN"; then
+  echo "DRY_RUN=1: command verified; exiting before model load."
+  exit 0
+fi
 
 exec docker exec -i "${EXEC_ENV[@]}" "$CONTAINER_NAME" "${ARGS[@]}"
