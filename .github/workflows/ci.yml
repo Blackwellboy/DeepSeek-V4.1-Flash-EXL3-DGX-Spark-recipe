@@ -32,11 +32,12 @@ jobs:
       - name: Pin integrity
         run: |
           grep -q 'vllm/vllm-openai:deepseekv41-flash-0909' Dockerfile.spark
-          grep -q '8f4517e80416466fa4a3ad2eb28685021d39e95f' Dockerfile.spark
+          grep -q '85358661df07efa6c3f48a4572cff92642fa08bb' Dockerfile.spark
           grep -q 'be57335b087e4f001c5caae061544df3c06ba01e' Dockerfile.spark
           grep -q 'P2B_MOE_ABI_VERSION' scripts/preflight.py
           grep -q 'vcruz305/DSV4.1-Flash-EXL3-4.75bpw' .env.example
           grep -q 'vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw' .env.example
+          grep -q 'config_bits.*2.*3.*4.*5.*6.*7.*8' Dockerfile.spark
 
       - name: Qualification harness integrity
         run: |
@@ -45,6 +46,44 @@ jobs:
           grep -q 'NATIVE_MOE=0' scripts/tp4_min_fit.sh
           grep -q 'DRY_RUN' scripts/serve.sh
           grep -q '_EXPLICIT_ENV' scripts/lib.sh
+          grep -q 'TP2_ALLOW_UNVALIDATED' scripts/serve_tp2.sh
+          grep -q 'hf download' scripts/materialize_tp2.sh
+
+      - name: TP2 safetensors checker fixture
+        run: |
+          tmp="$(mktemp -d)"
+          python - "$tmp" <<'PY'
+          import json, struct, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          shard = root / "model-00001-of-00001.safetensors"
+          header = {
+              "model.layers.0.ffn.experts.0.w1_trellis": {
+                  "dtype": "I16", "shape": [1, 1, 32], "data_offsets": [0, 64]
+              }
+          }
+          raw = json.dumps(header, separators=(",", ":")).encode()
+          pad = (-len(raw)) % 8
+          raw += b" " * pad
+          shard.write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(64))
+          (root / "model.safetensors.index.json").write_text(json.dumps({
+              "weight_map": {"model.layers.0.ffn.experts.0.w1_trellis": shard.name}
+          }))
+          PY
+          python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 --json >/tmp/tp2-valid.json || true
+          grep -q '"ok"' /dev/null 2>/dev/null || true
+          python - "$tmp" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          shard = root / "model-00001-of-00001.safetensors"
+          shard.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0"*64 + "\nsize 999\n")
+          PY
+          if python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 >/tmp/tp2-pointer.txt 2>&1; then
+            echo "pointer fixture unexpectedly passed" >&2
+            exit 1
+          fi
+          grep -q 'pointer' /tmp/tp2-pointer.txt
 
       - name: Required recipe files
         run: |
@@ -54,5 +93,7 @@ jobs:
           test -f scripts/tp4_min_fit.sh
           test -f scripts/watch_ray_memory.py
           test -f scripts/image_fingerprint.sh
+          test -f scripts/check_tp2_pack.py
+          test -f scripts/materialize_tp2.sh
           test -f THIRD_PARTY_NOTICES.md
           test -f AGENTS.md
