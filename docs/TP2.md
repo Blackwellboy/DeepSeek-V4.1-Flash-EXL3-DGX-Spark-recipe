@@ -17,7 +17,7 @@ TP2 is the aggressive target. Treat it as a separate checkpoint, storage, loader
 - expert hidden/intermediate: **5120 x 2304** on every rank
 - top-k routing: 6
 
-The dimensions are 128-aligned, but 192 local experts exceed the current ExLlamaV3 fused-MoE 128-expert envelope.
+Both dimensions are 128-aligned. **192 local experts is not an ExLlamaV3 fused-MoE expert-count limit.** Upstream ExLlamaV3 sizes the fused pointer tables from the actual number of experts and includes K1-K8 fused kernel instances. The historical `>128` fallback in `vllm-exl3` refers to the number of tokens assigned to a single expert in a batch, not the total local expert count.
 
 ## Recovery step 1: materialize the checkpoint correctly
 
@@ -29,11 +29,11 @@ Use a filesystem with substantial free space:
 bash scripts/materialize_tp2.sh /large/models/DSV4.1-Flash-SAGE-EXL3-TP2
 ```
 
-The helper uses `hf download`, `huggingface-cli`, or `huggingface_hub.snapshot_download`, then runs the TP2 pack checker.
+The helper uses `hf download`, `huggingface-cli`, or `huggingface_hub.snapshot_download`, then runs the TP2 pack checker. It also relocates **HF Hub and Xet caches to the same large filesystem** by default so a nearly-full Spark root disk is not consumed by hidden cache/staging traffic.
 
 The default pre-download free-space gate is intentionally conservative (`TP2_DOWNLOAD_MIN_FREE_GIB=500`). Override it only after measuring the exact snapshot plus Docker/build/cache staging requirements.
 
-If a Spark root filesystem is short by ~60 GB, move the model snapshot/cache to a larger NVMe/shared mount. Freeing enough space to finish a download does **not** solve loader or unified-memory compatibility by itself.
+If a Spark root filesystem is short by ~60 GB, move the model snapshot **and Hugging Face/Xet caches** to a larger NVMe/shared mount. Freeing enough space to finish a download does **not** solve loader or unified-memory compatibility by itself.
 
 ## Recovery step 2: validate shards and K geometry
 
@@ -65,11 +65,13 @@ The current vLLM integration supports mixed precision **between transformer laye
 
 `vllm-exl3` pinned by this recipe now accepts config K2-K8:
 
-- K2-K4 may use qualified native paths where all other gates pass;
-- K5-K8 use generic ExLlamaV3/LinearEXL3 fallback;
+- ExLlamaV3's normal fused EXL3 MoE path has K1-K8 kernel instances;
+- `vllm-exl3`'s separate custom native p2b path remains K2-K4 only;
 - tensor-level mixed K inside one routed layer remains unsupported.
 
-The fastest compatibility path is therefore **not** global uniform K. Instead, coalesce the exact SAGE tensor-level recipe to one K per transformer layer while preserving K2-K8 variation across the 40 layers:
+The correctness-first TP2 backend is therefore **ExLlamaV3 (`NATIVE_MOE=0`)**, not the custom p2b experiment.
+
+The fastest compatibility path is **not** global uniform K. Instead, coalesce the exact SAGE tensor-level recipe to one K per transformer layer while preserving K2-K8 variation across the 40 layers:
 
 ```bash
 python tools/coalesce_v41_vllm_recipe.py \
@@ -104,7 +106,7 @@ After a corrected snapshot exists:
 1. materialize it on a sufficiently large mount on both Sparks;
 2. run `check_tp2_pack.py` and require zero bad shards and zero mixed-K layers;
 3. build the pinned recipe image with K2-K8-capable `vllm-exl3`;
-4. start text-only, eager, batch/seq 1, DSpark off;
+4. start with `NATIVE_MOE=0`, text-only, eager, batch/seq 1, DSpark off;
 5. prove 8K first;
 6. then 32K;
 7. then 64K;
@@ -122,6 +124,7 @@ MODEL=/models/DSV4.1-Flash-SAGE-EXL3-TP2-vllm \
 GPU_MEMORY_UTILIZATION=0.75 \
 MAX_MODEL_LEN=8192 \
 MAX_NUM_SEQS=1 \
+NATIVE_MOE=0 \
 DSPARK=0 \
 EAGER=1 \
 TEXT_ONLY=1 \
