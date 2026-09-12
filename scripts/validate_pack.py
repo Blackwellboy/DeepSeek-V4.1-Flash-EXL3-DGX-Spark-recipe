@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -21,38 +22,59 @@ from runtime_lock import load_lock
 MAX_HEADER_BYTES = 256 * 1024 * 1024
 LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 ROUTED_RE = re.compile(r"(?:^|\.)(?:ffn\.)?experts(?:\.|$)")
+DTYPE_BYTES: dict[str, int] = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+    "F64": 8,
+}
 
 
 def gib(value: int) -> float:
     return value / (1024**3)
 
 
-def read_safetensors_header(path: Path) -> tuple[str, dict[str, Any] | None, str | None, int]:
+def read_safetensors_header(
+    path: Path,
+) -> tuple[str, dict[str, Any] | None, str | None, int, str | None]:
     size = path.stat().st_size
     with path.open("rb") as handle:
         first = handle.read(256)
         if first.startswith(b"version https://git-lfs.github.com/spec/v1"):
-            return "pointer", None, "Git LFS pointer stub; payload not materialized", 0
+            return "pointer", None, "Git LFS pointer stub; payload not materialized", 0, None
         if first.lstrip().lower().startswith((b"<html", b"<!doctype", b"<?xml")):
-            return "html", None, "HTML/XML response saved instead of safetensors", 0
+            return "html", None, "HTML/XML response saved instead of safetensors", 0, None
         if size < 16:
-            return "truncated", None, f"file is only {size} bytes", 0
+            return "truncated", None, f"file is only {size} bytes", 0, None
         handle.seek(0)
         raw = handle.read(8)
         header_len = struct.unpack("<Q", raw)[0]
         if header_len <= 1 or header_len > MAX_HEADER_BYTES:
-            return "invalid", None, f"implausible safetensors header length {header_len}", 0
+            return "invalid", None, f"implausible safetensors header length {header_len}", 0, None
         payload_start = 8 + header_len
         if payload_start > size:
-            return "truncated", None, f"header ends at {payload_start}, file size is {size}", 0
+            return "truncated", None, f"header ends at {payload_start}, file size is {size}", 0, None
         header_raw = handle.read(header_len)
     try:
         header = json.loads(header_raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return "invalid", None, f"header JSON decode failed: {exc}", 0
+        return "invalid", None, f"header JSON decode failed: {exc}", 0, None
     if not isinstance(header, dict):
-        return "invalid", None, "safetensors header is not a JSON object", 0
-    return "ok", header, None, payload_start
+        return "invalid", None, "safetensors header is not a JSON object", 0, None
+    return "ok", header, None, payload_start, hashlib.sha256(header_raw).hexdigest()
 
 
 def trellis_k(meta: Any) -> int | None:
@@ -68,6 +90,24 @@ def trellis_k(meta: Any) -> int | None:
     if words <= 0 or words % 16:
         return None
     return words // 16
+
+
+def expected_tensor_bytes(meta: dict[str, Any]) -> int | None:
+    dtype = str(meta.get("dtype", ""))
+    itemsize = DTYPE_BYTES.get(dtype)
+    shape = meta.get("shape")
+    if itemsize is None or not isinstance(shape, list):
+        return None
+    count = 1
+    try:
+        for dim in shape:
+            value = int(dim)
+            if value < 0:
+                return None
+            count *= value
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count * itemsize
 
 
 def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[str, Any]:
@@ -153,7 +193,11 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
     statuses: Counter[str] = Counter()
     bad_shards: list[dict[str, str]] = []
     missing_index_tensors: list[dict[str, str]] = []
+    unindexed_tensors: list[dict[str, str]] = []
     invalid_offsets: list[dict[str, Any]] = []
+    size_mismatches: list[dict[str, Any]] = []
+    unknown_dtypes: Counter[str] = Counter()
+    shard_headers: dict[str, str] = {}
     k_hist: Counter[int] = Counter()
     routed_layer_ks: dict[int, set[int]] = defaultdict(set)
     routed_layer_examples: dict[int, dict[int, str]] = defaultdict(dict)
@@ -167,39 +211,58 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
             bad_shards.append({"shard": shard_name, "status": "missing", "reason": "not found"})
             continue
         total_bytes += path.stat().st_size
-        status, header, reason, payload_start = read_safetensors_header(path)
+        status, header, reason, payload_start, header_sha = read_safetensors_header(path)
         statuses[status] += 1
         if status != "ok" or header is None:
             bad_shards.append({"shard": shard_name, "status": status, "reason": reason or "unknown"})
             continue
+        if header_sha:
+            shard_headers[shard_name] = header_sha
 
         header_keys = {str(name) for name in header if name != "__metadata__"}
         for expected in sorted(expected_by_shard[shard_name] - header_keys):
             missing_index_tensors.append({"shard": shard_name, "tensor": expected})
+        for extra in sorted(header_keys - expected_by_shard[shard_name]):
+            unindexed_tensors.append({"shard": shard_name, "tensor": extra})
 
         payload_bytes = path.stat().st_size - payload_start
         for name, meta in header.items():
             if name == "__metadata__" or not isinstance(meta, dict):
                 continue
             offsets = meta.get("data_offsets")
+            start = end = -1
+            offsets_valid = False
             if isinstance(offsets, list) and len(offsets) == 2:
                 try:
                     start, end = int(offsets[0]), int(offsets[1])
+                    offsets_valid = start >= 0 and end >= start and end <= payload_bytes
                 except (TypeError, ValueError, OverflowError):
-                    start = end = -1
-                if start < 0 or end < start or end > payload_bytes:
-                    invalid_offsets.append(
+                    offsets_valid = False
+            if not offsets_valid:
+                invalid_offsets.append(
+                    {
+                        "shard": shard_name,
+                        "tensor": name,
+                        "data_offsets": offsets,
+                        "payload_bytes": payload_bytes,
+                    }
+                )
+            else:
+                expected_bytes = expected_tensor_bytes(meta)
+                if expected_bytes is None:
+                    dtype = str(meta.get("dtype", "<missing>"))
+                    unknown_dtypes[dtype] += 1
+                elif end - start != expected_bytes:
+                    size_mismatches.append(
                         {
                             "shard": shard_name,
                             "tensor": name,
-                            "data_offsets": offsets,
-                            "payload_bytes": payload_bytes,
+                            "dtype": meta.get("dtype"),
+                            "shape": meta.get("shape"),
+                            "offset_bytes": end - start,
+                            "expected_bytes": expected_bytes,
                         }
                     )
-            else:
-                invalid_offsets.append(
-                    {"shard": shard_name, "tensor": name, "data_offsets": offsets, "payload_bytes": payload_bytes}
-                )
 
             if name.endswith((".mcg", "_mcg")):
                 codebook_markers["mcg"] += 1
@@ -237,7 +300,11 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
             "shard_status": dict(sorted(statuses.items())),
             "bad_shards": bad_shards,
             "missing_index_tensors": missing_index_tensors,
+            "unindexed_tensors": unindexed_tensors,
             "invalid_data_offsets": invalid_offsets,
+            "tensor_size_mismatches": size_mismatches,
+            "unknown_dtypes": dict(sorted(unknown_dtypes.items())),
+            "shard_header_sha256": dict(sorted(shard_headers.items())),
             "materialized_shard_bytes": total_bytes,
             "materialized_shard_gib": gib(total_bytes),
             "trellis_k_histogram": {str(k): n for k, n in sorted(k_hist.items())},
@@ -252,8 +319,14 @@ def validate_pack(model_dir: Path, topology: str, reserve_gib: float) -> dict[st
         errors.append(f"{len(bad_shards)} of {len(shards)} indexed shards are not materialized valid safetensors")
     if missing_index_tensors:
         errors.append(f"{len(missing_index_tensors)} index entries are absent from their declared shard headers")
+    if unindexed_tensors:
+        errors.append(f"{len(unindexed_tensors)} shard tensors are absent from model.safetensors.index.json")
     if invalid_offsets:
         errors.append(f"{len(invalid_offsets)} tensors have invalid/out-of-range safetensors data_offsets")
+    if size_mismatches:
+        errors.append(f"{len(size_mismatches)} tensors have dtype/shape byte counts inconsistent with data_offsets")
+    if unknown_dtypes:
+        warnings.append(f"unknown safetensors dtypes were not byte-size checked: {dict(unknown_dtypes)}")
     if unsupported_k:
         errors.append(f"trellis K outside locked runtime capability: {unsupported_k}")
     if layer_uniform_required and mixed_layers:
