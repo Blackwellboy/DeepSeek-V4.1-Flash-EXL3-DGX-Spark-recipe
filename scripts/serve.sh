@@ -10,6 +10,7 @@ if [[ "$TP" != "2" && "$TP" != "4" ]]; then
 fi
 
 MODEL="$(resolve_model_for_tp "$TP")"
+MODEL_REVISION_RESOLVED="$(resolve_model_revision_for_tp "$TP")"
 export MODEL
 require_env MODEL
 
@@ -25,25 +26,27 @@ if [[ ! "$GPU_COUNT" =~ ^[0-9]+$ ]] || (( GPU_COUNT < TP )); then
   exit 2
 fi
 
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
-# GB10 CPU and GPU share one 128 GB physical memory pool. Keep the public
-# first-boot default conservative; increase only from measured headroom.
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.75}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
-TEXT_ONLY="${TEXT_ONLY:-1}"
-DSPARK="${DSPARK:-0}"
-EAGER="${EAGER:-1}"
+LOCK_MAX_MODEL_LEN="$(python3 "$LOCK_TOOL" get first_boot.max_model_len)"
+LOCK_GPU_MEMORY_UTILIZATION="$(python3 "$LOCK_TOOL" get first_boot.gpu_memory_utilization)"
+LOCK_MAX_NUM_SEQS="$(python3 "$LOCK_TOOL" get first_boot.max_num_seqs)"
+LOCK_MAX_NUM_BATCHED_TOKENS="$(python3 "$LOCK_TOOL" get first_boot.max_num_batched_tokens)"
+LOCK_TEXT_ONLY="$(python3 "$LOCK_TOOL" get first_boot.text_only)"
+LOCK_DSPARK="$(python3 "$LOCK_TOOL" get first_boot.dspark)"
+LOCK_EAGER="$(python3 "$LOCK_TOOL" get first_boot.eager)"
+LOCK_NATIVE_MOE="$(python3 "$LOCK_TOOL" get first_boot.native_moe)"
+
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$LOCK_MAX_MODEL_LEN}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-$LOCK_GPU_MEMORY_UTILIZATION}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-$LOCK_MAX_NUM_SEQS}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$LOCK_MAX_NUM_BATCHED_TOKENS}"
+TEXT_ONLY="${TEXT_ONLY:-$LOCK_TEXT_ONLY}"
+DSPARK="${DSPARK:-$LOCK_DSPARK}"
+EAGER="${EAGER:-$LOCK_EAGER}"
 DRY_RUN="${DRY_RUN:-0}"
+NATIVE_MOE="${NATIVE_MOE:-$LOCK_NATIVE_MOE}"
 
 # Correctness-first default for both EP2 and EP4 is ExLlamaV3's fused/fallback
-# routed-expert path. ExLlamaV3 itself has K1-K8 fused MoE kernel instances and
-# is not limited to 128 total experts. The old >128 fallback in vllm-exl3 is a
-# per-expert token-count condition. ABI-3 native p2b stays an explicit K2-K4 A/B.
-if [[ -z "${NATIVE_MOE:-}" ]]; then
-  NATIVE_MOE=0
-fi
-
+# routed-expert path. Native p2b remains an explicit K2-K4 A/B.
 EXEC_ENV=(
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600
   -e VLLM_USE_RUST_FRONTEND=1
@@ -84,8 +87,8 @@ ARGS=(
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
 )
 
-if [[ -n "${MODEL_REVISION:-}" ]]; then
-  ARGS+=( --revision "$MODEL_REVISION" )
+if [[ -n "$MODEL_REVISION_RESOLVED" ]]; then
+  ARGS+=( --revision "$MODEL_REVISION_RESOLVED" )
 fi
 
 if is_true "$TEXT_ONLY"; then
@@ -117,6 +120,7 @@ cat <<EOF
 Topology:               TP$TP + EP$TP
 Ray GPUs:               $GPU_COUNT
 Model:                  $MODEL
+Model revision:         ${MODEL_REVISION_RESOLVED:-<local-or-unpinned-override>}
 Served name:            $SERVED_MODEL_NAME
 EXL3 backend variant:   $BACKEND_LABEL
 Native V4.1 MoE:        $NATIVE_MOE
