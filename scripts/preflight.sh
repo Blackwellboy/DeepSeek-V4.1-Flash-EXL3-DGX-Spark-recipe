@@ -8,6 +8,9 @@ if [[ "$TP" != "2" && "$TP" != "4" ]]; then
   echo "Usage: $0 2|4" >&2
   exit 2
 fi
+
+MODEL="$(resolve_model_for_tp "$TP")"
+export MODEL
 require_env MODEL
 
 ARGS=(python /recipe/scripts/preflight.py --model "$MODEL" --tp "$TP")
