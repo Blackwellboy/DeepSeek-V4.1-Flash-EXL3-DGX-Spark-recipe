@@ -27,16 +27,18 @@ The command-line settings in this repository are independently assembled from pu
 ## vllm-exl3
 
 - Project: https://github.com/vcruz305/vllm-exl3
-- Pinned revision: `3ce1ae08f3e4a9545c58d5ac6456807c702d524a`
-- Role here: vLLM quantization plugin, routed-expert EXL3 loading/execution, source-quantization delegation, DeepSeek V4.1 TP/EP planning, mixed-K capability declaration, and native ABI-3 dynamic MoE geometry.
+- Pinned revision: `ee8c2c171bbe0d036a3accb24a76af5a95506748`
+- Role here: vLLM quantization plugin, routed-expert EXL3 loading/execution, source-quantization delegation, DeepSeek V4.1 TP/EP planning, mixed-K capability declaration, current-vLLM MoE TP/EP geometry compatibility, and native ABI-3 dynamic MoE geometry.
 - License at the pinned revision: AGPL-3.0-only, with additional historical/third-party notices in that repository.
 
-That pinned revision includes PR #9 by `@fattchris`, which contributed:
+The pinned history includes PR #9 by `@fattchris`, which contributed:
 
 - setuptools>=77-compatible relative CUDA extension source paths;
 - an explicitly opt-in diagnostic shape-mismatch mode;
 - coordinate-preserving overlap copies for that diagnostic path;
 - regression tests preserving the default hard-fail behavior.
+
+The subsequent mainline TP/EP compatibility layer resolves the authoritative current-vLLM geometry from `RoutedExperts.moe_config.moe_parallel_config` before any process-wide TP fallback. This prevents EP layouts (MoE TP=1) from being incorrectly sliced according to the process TP world size.
 
 The runtime image builds the plugin from its own source repository so its license and attribution files remain available in `/opt/vllm-exl3`.
 
