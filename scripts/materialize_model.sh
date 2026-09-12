@@ -17,8 +17,29 @@ esac
 REPO="$(resolve_model_for_tp "$TP")"
 REVISION="$(resolve_model_revision_for_tp "$TP")"
 TOPOLOGY="tp$TP"
+LOCK_REPO="$(python3 "$LOCK_TOOL" get models.$TOPOLOGY.repo_id)"
+LOCK_STATUS="$(python3 "$LOCK_TOOL" get models.$TOPOLOGY.status)"
 MIN_FREE_GIB="${DOWNLOAD_MIN_FREE_GIB:-550}"
 POST_RESERVE_GIB="${PACK_RESERVE_GIB:-32}"
+
+if [[ "$REPO" == "$LOCK_REPO" && "$LOCK_STATUS" != "deployable" ]]; then
+  if ! is_true "${ALLOW_SOURCE_ARTIFACT_DOWNLOAD:-0}"; then
+    cat >&2 <<EOF
+ERROR: the locked $TOPOLOGY Hugging Face artifact is not marked deployable:
+  repo:   $REPO
+  status: $LOCK_STATUS
+
+This artifact may still be useful for compatibility/repack work, but downloading it
+can consume hundreds of GiB before the physical layout gate rejects it.
+
+If you intentionally want the source/qualification artifact, rerun with:
+  ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 bash scripts/materialize_model.sh $TP $DEST
+EOF
+    exit 2
+  fi
+  echo "WARNING: downloading locked source/qualification artifact with status '$LOCK_STATUS'." >&2
+fi
+
 mkdir -p "$DEST"
 
 # Keep all Hugging Face/Xet staging on the same large filesystem as the model.
@@ -52,6 +73,7 @@ echo "=== DeepSeek V4.1 EXL3 materialization ==="
 echo "Topology:    $TOPOLOGY"
 echo "Repo:        $REPO"
 echo "Revision:    ${REVISION:-<unlocked/quarantined>}"
+echo "Status:      ${LOCK_STATUS:-<custom-model>}"
 echo "Destination: $DEST"
 echo "HF_HOME:     $HF_HOME"
 echo "Free space:  $FREE_GIB GiB"
