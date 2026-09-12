@@ -2,7 +2,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
 FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
-ARG VLLM_EXL3_REF=3ce1ae08f3e4a9545c58d5ac6456807c702d524a
+ARG VLLM_EXL3_REF=ee8c2c171bbe0d036a3accb24a76af5a95506748
 ARG VLLM_EXL3_REPO=https://github.com/vcruz305/vllm-exl3.git
 ARG EXLLAMAV3_REF=be57335b087e4f001c5caae061544df3c06ba01e
 ARG TORCH_CUDA_ARCH_LIST=12.1a
@@ -76,6 +76,7 @@ assert diag["mixed_k"]["config_bits"] == [2, 3, 4, 5, 6, 7, 8], diag["mixed_k"]
 assert diag["mixed_k"]["exllamav3_moe_kernel_bits"] == [1, 2, 3, 4, 5, 6, 7, 8], diag["mixed_k"]
 assert diag["mixed_k"]["native_qualified_bits"] == [2, 3, 4], diag["mixed_k"]
 assert diag["mixed_k"]["tensor_level_mixed_k_within_layer"] is False
+assert diag["tp_geometry"]["nested_moe_config_compat_installed"] is True, diag["tp_geometry"]
 plan2 = vllm_exl3.plan_deepseek_v41(tensor_parallel_size=2, expert_parallel=True)
 assert plan2.local_experts == 192
 assert plan2.preferred_first_boot_backend == "exllamav3"
