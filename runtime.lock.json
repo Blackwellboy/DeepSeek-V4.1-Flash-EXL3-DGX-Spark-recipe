@@ -1,6 +1,6 @@
 {
   "schema": "dsv41-exl3-runtime-lock.v1",
-  "generated_at": "2026-09-12T18:39:00Z",
+  "generated_at": "2026-09-12T19:25:00Z",
   "base_image": {
     "ref": "vllm/vllm-openai:deepseekv41-flash-0909",
     "digest": null,
@@ -8,7 +8,7 @@
   },
   "vllm_exl3": {
     "repo": "https://github.com/vcruz305/vllm-exl3.git",
-    "commit": "21fa627a3933d80de2d1030e732354d8c3cd761e"
+    "commit": "3ce1ae08f3e4a9545c58d5ac6456807c702d524a"
   },
   "exllamav3": {
     "repo": "https://github.com/turboderp-org/exllamav3.git",
@@ -21,7 +21,8 @@
     "exllamav3_moe_kernel_k": [1, 2, 3, 4, 5, 6, 7, 8],
     "native_p2b_k": [2, 3, 4],
     "routed_allocation_scope": "one_k_per_routedexperts_transformer_layer",
-    "tensor_level_mixed_k_within_layer": false
+    "tensor_level_mixed_k_within_layer": false,
+    "diagnostic_shape_overlap": "opt_in_coordinate_preserving"
   },
   "models": {
     "tp4": {
