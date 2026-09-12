@@ -63,17 +63,22 @@ jobs:
               }
           }
           raw = json.dumps(header, separators=(",", ":")).encode()
-          pad = (-len(raw)) % 8
-          raw += b" " * pad
+          raw += b" " * ((-len(raw)) % 8)
           shard.write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(64))
           (root / "model.safetensors.index.json").write_text(json.dumps({
               "weight_map": {"model.layers.0.ffn.experts.0.w1_trellis": shard.name}
           }))
           PY
-          python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 --json >/tmp/tp2-valid.json || true
-          grep -q '"ok"' /dev/null 2>/dev/null || true
+          python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 --json >/tmp/tp2-valid.json
+          python - <<'PY'
+          import json
+          report = json.load(open('/tmp/tp2-valid.json'))
+          assert report['deployable_with_current_pinned_loader'] is True, report
+          assert report['trellis_k_histogram'] == {'2': 1}, report
+          assert report['bad_shards'] == [], report
+          PY
           python - "$tmp" <<'PY'
-          import json, sys
+          import sys
           from pathlib import Path
           root = Path(sys.argv[1])
           shard = root / "model-00001-of-00001.safetensors"
