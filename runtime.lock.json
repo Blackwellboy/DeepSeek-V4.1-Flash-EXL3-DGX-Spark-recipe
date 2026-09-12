@@ -1,6 +1,6 @@
 {
   "schema": "dsv41-exl3-runtime-lock.v1",
-  "generated_at": "2026-09-12T19:25:00Z",
+  "generated_at": "2026-09-12T19:47:00Z",
   "base_image": {
     "ref": "vllm/vllm-openai:deepseekv41-flash-0909",
     "digest": null,
@@ -8,7 +8,7 @@
   },
   "vllm_exl3": {
     "repo": "https://github.com/vcruz305/vllm-exl3.git",
-    "commit": "3ce1ae08f3e4a9545c58d5ac6456807c702d524a"
+    "commit": "ee8c2c171bbe0d036a3accb24a76af5a95506748"
   },
   "exllamav3": {
     "repo": "https://github.com/turboderp-org/exllamav3.git",
@@ -22,7 +22,8 @@
     "native_p2b_k": [2, 3, 4],
     "routed_allocation_scope": "one_k_per_routedexperts_transformer_layer",
     "tensor_level_mixed_k_within_layer": false,
-    "diagnostic_shape_overlap": "opt_in_coordinate_preserving"
+    "diagnostic_shape_overlap": "opt_in_coordinate_preserving",
+    "tp_geometry_source": "RoutedExperts.moe_config.moe_parallel_config_before_process_tp"
   },
   "models": {
     "tp4": {
