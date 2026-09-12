@@ -24,7 +24,29 @@ if [[ -n "$MODEL_REVISION_RESOLVED" ]]; then
   ARGS+=( --revision "$MODEL_REVISION_RESOLVED" )
 fi
 
+echo "=== Static/runtime preflight ==="
 docker exec -i \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   "$CONTAINER_NAME" \
   "${ARGS[@]}"
+
+if is_true "${SKIP_NCCL_COLLECTIVE:-0}"; then
+  echo "WARNING: SKIP_NCCL_COLLECTIVE=1; distributed GPU transport was not qualified." >&2
+  exit 0
+fi
+
+echo
+echo "=== Cross-node NCCL collective preflight ==="
+COLLECTIVE_ARGS=(
+  python /recipe/scripts/cluster_collective.py
+  --tp "$TP"
+  --megabytes "${COLLECTIVE_MEGABYTES:-16}"
+  --warmup "${COLLECTIVE_WARMUP:-2}"
+  --iterations "${COLLECTIVE_ITERATIONS:-5}"
+  --master-port "${COLLECTIVE_MASTER_PORT:-29557}"
+)
+if is_true "${COLLECTIVE_JSON:-0}"; then
+  COLLECTIVE_ARGS+=( --json )
+fi
+
+docker exec -i "$CONTAINER_NAME" "${COLLECTIVE_ARGS[@]}"
