@@ -1,215 +1,167 @@
 # DeepSeek-V4.1-Flash EXL3 on DGX Spark
 
-Turnkey serving and qualification recipes for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10, with separate **TP4 (4 Spark)** and **TP2 (2 Spark)** paths.
+Serving and qualification tooling for **DeepSeek-V4.1-Flash EXL3** on NVIDIA DGX Spark / GB10 with separate TP4 and TP2 paths.
 
-> **Runtime boundary:** vLLM owns the DeepSeek-V4.1 model graph (CED/CSA2, Engram, vision, DSpark, parsers). `vllm-exl3` supplies EXL3 routed-expert storage/execution. Standalone ExLlamaV3 is an expert-kernel dependency here, not the V4.1 model loader. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+> **Runtime boundary:** vLLM owns the DeepSeek-V4.1 model graph (CED/CSA2, Engram, vision, DSpark and parsers). `vllm-exl3` supplies EXL3 routed-expert storage/execution. ExLlamaV3 is an EXL3 kernel dependency in this recipe; it is not the model-graph owner.
 
-## Hugging Face checkpoints
+## Current release status
 
-| Topology | Checkpoint | Status |
+| Topology | Hugging Face artifact | Current vLLM recipe status |
 |---|---|---|
-| **TP4 / 4× DGX Spark** | [`vcruz305/DSV4.1-Flash-EXL3-4.75bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3-4.75bpw) | TP4 qualification checkpoint |
-| **TP2 / 2× DGX Spark** | [`vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw) | **Recovery/source artifact; direct vLLM deployment is quarantined** pending shard validation + layer-uniform-K repack |
+| **TP4 / 4× Spark** | [`vcruz305/DSV4.1-Flash-EXL3-4.75bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3-4.75bpw) | **Source/qualification artifact pending physical layer-K validation.** The published pack is SAGE tensor-granular mixed-K; current `vllm-exl3` allocates one K per routed transformer layer. |
+| **TP2 / 2× Spark** | [`vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw) | **Quarantined source artifact.** Requires valid materialized shards plus a layer-uniform routed-K compatibility repack. |
 
-The older [`vcruz305/DSV4.1-Flash-EXL3`](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3) repo is a work/supersession pointer.
+The recipe intentionally fails closed instead of spending hours downloading/building/loading a checkpoint whose physical layout is incompatible with the pinned loader.
 
-## Pinned Spark runtime
+The older [`vcruz305/DSV4.1-Flash-EXL3`](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3) repository is a supersession pointer.
 
-| Component | Pin |
-|---|---|
-| DeepSeek V4.1 image | `vllm/vllm-openai:deepseekv41-flash-0909` |
-| `vllm-exl3` | `21fa627a3933d80de2d1030e732354d8c3cd761e` |
-| ExLlamaV3 | `be57335b087e4f001c5caae061544df3c06ba01e` |
-| Spark CUDA target | `sm_121` / `TORCH_CUDA_ARCH_LIST=12.1a` |
+## One source of truth: `runtime.lock.json`
 
-The recipe never upgrades the base image to stock pip vLLM. The pinned plugin is CI-green and reports:
+`runtime.lock.json` is authoritative for:
+
+- dedicated V4.1 vLLM image;
+- exact `vllm-exl3` repository and commit;
+- exact ExLlamaV3 commit;
+- minimum native ABI;
+- CUDA architecture target;
+- accepted EXL3 K ranges;
+- routed allocation contract;
+- canonical HF model IDs/revisions;
+- safe first-boot settings.
+
+Current plugin pin:
 
 ```text
-accepted EXL3 config K:       K2-K8
-ExLlamaV3 fused MoE kernels:  K1-K8
-custom native p2b:            K2-K4 only
-routed allocation:            one K per transformer RoutedExperts layer
-tensor-level mixed K in layer:not yet supported
+vllm-exl3: 3ce1ae08f3e4a9545c58d5ac6456807c702d524a
 ```
 
-## Corrected TP2 architecture facts
+That includes the GB10 setuptools>=77 build fix and opt-in coordinate-preserving diagnostic shape-mismatch mode from PR #9 by @fattchris. Shape mismatch still **hard-fails by default**.
 
-DeepSeek-V4.1 has 384 routed experts, hidden size 5120, intermediate size 2304, and top-k 6.
+The locked runtime reports:
 
-| Layout | Local experts | Local expert shape | Correctness-first backend |
+```text
+accepted EXL3 config K:        K2-K8
+ExLlamaV3 MoE kernel family:   K1-K8
+custom native p2b:             K2-K4 only
+routed allocation:             one K per RoutedExperts transformer layer
+tensor-level mixed K in layer: not currently supported
+```
+
+## Architecture
+
+DeepSeek-V4.1 has 384 routed experts, hidden size 5120, expert intermediate size 2304 and top-k 6.
+
+| Layout | Local experts | Expert shape/rank | First correctness backend |
 |---|---:|---:|---|
-| **TP4 + EP4** | 96 | 5120 × 2304 | ExLlamaV3 |
-| **TP2 + EP2** | 192 | 5120 × 2304 | ExLlamaV3 |
-| TP4 without EP | 384 | 5120 × 576 | Not recommended; 576 leaves a 128-tile tail |
+| TP4 + EP4 | 96 | 5120 × 2304 | ExLlamaV3 |
+| TP2 + EP2 | 192 | 5120 × 2304 | ExLlamaV3 |
+| TP4 without EP | 384 | 5120 × 576 | Not recommended |
 
-**192 local experts is not an ExLlamaV3 fused-MoE ceiling.** Upstream ExLlamaV3 sizes the pointer tables from the actual expert count and has K1-K8 fused instances. The historical `>128` fallback in `vllm-exl3` refers to **tokens assigned to one expert in a batch**, not the total number of local experts.
+**192 local experts is not an ExLlamaV3 total-expert ceiling.** The historical `>128` fallback in `vllm-exl3` is about tokens assigned to one expert in a batch, not total experts owned by a rank.
 
-The separate `vllm-exl3` native p2b backend remains an optional K2-K4 experiment. It is not the first-boot TP2 backend.
+## Validation-first quick start
 
----
+Do not begin with model loading. Qualify the host and artifact first.
 
-# TP2 recovery: current blockers and fixes
-
-A two-Spark lab campaign reported:
-
-- 29 of 31 local shard headers failing safetensors validation;
-- tensor-level mixed K2-K8 incompatible with the current one-K-per-layer routed allocation;
-- one Spark about 59.9 GB short on local disk before build/cache overhead;
-- very tight unified-memory headroom;
-- 128K context unverified.
-
-The recipe now **fails closed** instead of attempting an expensive model load through those blockers.
-
-## 1. Materialize the TP2 snapshot correctly
-
-A plain Git checkout is not proof that the Hugging Face large objects are materialized. Use the supplied downloader on a large NVMe/shared filesystem:
+### 1. Clone and create config
 
 ```bash
-bash scripts/materialize_tp2.sh /large/models/DSV4.1-Flash-SAGE-EXL3-TP2
-```
-
-The helper:
-
-- uses `hf download`, `huggingface-cli`, or `huggingface_hub.snapshot_download`;
-- defaults to a conservative 500 GiB free-space gate;
-- puts `HF_HOME`, Hub cache, and **Xet cache on the same large filesystem** as the model;
-- validates the downloaded snapshot before declaring it usable.
-
-This directly prevents the reported “Spark 2 is 59.9 GB short” condition from simply moving into hidden Hugging Face/Xet cache traffic on the root disk.
-
-## 2. Classify the 29/31 shard failures before rebuilding weights
-
-```bash
-python3 scripts/check_tp2_pack.py \
-  /large/models/DSV4.1-Flash-SAGE-EXL3-TP2 \
-  --reserve-gib 32
-```
-
-The checker reports:
-
-- missing indexed shards;
-- Git-LFS/Xet-compatible pointer stubs;
-- HTML/XML accidentally saved as model files;
-- truncated or invalid safetensors headers;
-- physical trellis K inferred from `shape[-1] / 16`;
-- K histogram;
-- layers containing more than one K;
-- materialized model bytes;
-- free filesystem capacity;
-- `DEPLOYABLE_CURRENT_LOADER=YES|NO`.
-
-If the 29 bad files are pointer stubs, proper Hugging Face materialization can fix that blocker **without requantizing**. If they remain genuinely truncated/invalid after proper materialization, those specific shards need to be rebuilt/re-uploaded.
-
-## 3. Repack SAGE mixed K for current vLLM
-
-The current published 3.30-bpw artifact is tensor-granular. Current `vllm-exl3` can execute K2-K8, but one `RoutedExperts` transformer layer still allocates one K width.
-
-The short path is **not uniform K3** and does not require throwing away SAGE's dynamic allocation. Instead, preserve mixed K **across the 40 transformer layers** while coalescing all routed tensors within each layer to one K:
-
-```bash
-# in vcruz305/SAGE-EXL3
-python tools/coalesce_v41_vllm_recipe.py \
-  /path/to/exact-tensor-level-tp2-recipe.yaml \
-  --out recipes/recipe-tp2-vllm-layer-uniform.yaml \
-  --min-k 2 \
-  --max-k 8
-```
-
-The optimizer minimizes deviation from the original tensor-level SAGE K allocation while preserving the aggregate average on roughly a **0.025-K grid** across 40 equal-geometry layers.
-
-Changing K requires a real re-encode. Use the existing SAGE encode bank to reuse exact `(tensor key, K)` variants and encode only missing deltas, then repack and run release/fidelity checks.
-
-See [`SAGE-EXL3/docs/V41_VLLM_TP2_COMPAT.md`](https://github.com/vcruz305/SAGE-EXL3/blob/main/docs/V41_VLLM_TP2_COMPAT.md).
-
-## 4. TP2 memory contract
-
-TP2 must use a **streamed/nonresident Engram/PLE strategy**. Do not treat it as a resident-Engram downsizing of TP4.
-
-The 4.75-bpw TP4 body is roughly 233 GiB excluding the ~189 GiB Engram/PLE component. Splitting that body over only two Sparks would be about 116.5 GiB/Spark before runtime/KV/workspaces, which is not a practical GB10 operating point.
-
-The SAGE TP2 build exists to reduce the body, but the corrected layer-uniform repack must be measured after encoding. Nominal “3.30 bpw” alone is not a memory-fit proof.
-
-`--cpu-offload-gb` is not a capacity escape hatch on DGX Spark because CPU and GPU share the same physical LPDDR5x pool.
-
-## 5. First corrected TP2 boot
-
-After the corrected local snapshot passes `check_tp2_pack.py`:
-
-```bash
-MODEL_DIR=/large/models \
-MODEL=/models/DSV4.1-Flash-SAGE-EXL3-TP2-vllm \
-MAX_MODEL_LEN=8192 \
-MAX_NUM_SEQS=1 \
-MAX_NUM_BATCHED_TOKENS=1024 \
-GPU_MEMORY_UTILIZATION=0.75 \
-NATIVE_MOE=0 \
-DSPARK=0 \
-EAGER=1 \
-TEXT_ONLY=1 \
-bash scripts/serve_tp2.sh
-```
-
-Qualification order:
-
-```text
-8K -> 32K -> 64K -> 128K only if measured memory headroom remains
-```
-
-**128K is currently unverified.** Do not publish it as supported until a real run proves it.
-
-`TP2_ALLOW_UNVALIDATED=1` exists only for loader-development experiments. Do not use it for deployment or benchmark claims.
-
-See [`docs/TP2.md`](docs/TP2.md).
-
----
-
-# TP4 qualification
-
-TP4 continues to use the 4.75-bpw checkpoint.
-
-A previous attempted “8K” capacity test was invalid because older recipe code let `.env` overwrite explicit shell overrides. Precedence is now:
-
-```text
-explicit shell environment > .env > built-in defaults
-```
-
-For the resident-Engram minimum-fit gate:
-
-```bash
-# resolve command only
-bash scripts/tp4_min_fit.sh --check
-
-# second terminal
-bash scripts/watch_cluster_memory.sh
-
-# actual run
-bash scripts/tp4_min_fit.sh
-```
-
-The printed launch must show 8192 / seq1 / text-only / eager / DSpark off / native off.
-
-If that verified run still reaches the same near-full unified-memory cliff during Engram loading and a worker becomes unresponsive, record:
-
-```text
-RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
-```
-
-Then stop memory-knob tuning and move to an explicitly identified nonresident/disk-backed Engram variant.
-
-See [`docs/TP4.md`](docs/TP4.md).
-
----
-
-# Quick start
-
-## Build the Spark runtime
-
-```bash
-bash scripts/build_runtime.sh
+git clone https://github.com/vcruz305/DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe
+cd DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe
 cp .env.example .env
 ```
 
-## Start Ray
+`.env.example` is now the safe **8K / seq1 / text-only / eager / DSpark-off / native-off** first-boot profile. Larger contexts are explicit qualification steps, not defaults.
+
+### 2. Host doctor
+
+Run on every Spark:
+
+```bash
+bash scripts/doctor.sh 4
+# or
+bash scripts/doctor.sh 2
+```
+
+The doctor checks Docker, NVIDIA visibility, host architecture, filesystem headroom, RDMA discovery, local image state and—when a local model is supplied—the physical checkpoint contract.
+
+### 3. Build the locked runtime
+
+```bash
+bash scripts/build_runtime.sh
+```
+
+Build inputs come from `runtime.lock.json`. Experimental overrides require:
+
+```bash
+ALLOW_RUNTIME_OVERRIDE=1 ... bash scripts/build_runtime.sh
+```
+
+The Dockerfile includes GB10 fixes contributed and hardware-tested by @fattchris: conditional `python` alias creation, dynamic cuSPARSE header discovery, configurable `VLLM_EXL3_REPO`, and the merged plugin SHA.
+
+### 4. Materialize a model onto a large filesystem
+
+TP4:
+
+```bash
+ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
+  bash scripts/materialize_model.sh 4 /large/models/DSV4.1-Flash-EXL3-TP4
+```
+
+TP2:
+
+```bash
+ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
+  bash scripts/materialize_model.sh 2 /large/models/DSV4.1-Flash-EXL3-TP2
+```
+
+The generic materializer keeps `HF_HOME`, Hub cache and Xet cache on the same large filesystem, pins the HF revision when one is locked, then runs the physical pack validator.
+
+Current TP4/TP2 artifacts are source/qualification artifacts rather than declared vLLM-deployable packs, so downloading them for compatibility work is deliberately explicit.
+
+### 5. Validate a local pack
+
+```bash
+python3 scripts/validate_pack.py \
+  /large/models/DSV4.1-Flash-EXL3-TP4 \
+  --topology tp4 \
+  --reserve-gib 32
+```
+
+or:
+
+```bash
+python3 scripts/validate_pack.py \
+  /large/models/DSV4.1-Flash-EXL3-TP2 \
+  --topology tp2 \
+  --reserve-gib 32
+```
+
+The validator checks without loading weights:
+
+- all indexed shards exist and are real safetensors, not LFS/Xet pointers or HTML;
+- index entries exist in their declared shard;
+- no unexpected shard tensor is missing from the index;
+- `data_offsets` are in bounds;
+- known dtype/shape byte counts equal the declared tensor byte range;
+- physical EXL3 K inferred from trellis geometry;
+- K values are within the locked runtime capability;
+- routed transformer layers obey the loader's one-K-per-layer contract;
+- model/config source-quantization metadata matches V4.1 expectations;
+- filesystem reserve remains available;
+- per-shard safetensors-header hashes are emitted for cheap cross-node comparison.
+
+Require:
+
+```text
+DEPLOYABLE_CURRENT_LOADER=YES
+```
+
+before treating a pack as deployment-ready.
+
+### 6. Start Ray
+
+`ENABLE_RDMA=auto` is the default. It maps `/dev/infiniband` only when present. `ENABLE_RDMA=1` requires it and hard-fails if missing; `ENABLE_RDMA=0` leaves network selection to NCCL/Gloo.
 
 Head:
 
@@ -223,71 +175,123 @@ Worker:
 HEAD_IP=10.0.0.10 NODE_IP=10.0.0.11 bash scripts/start_cluster.sh worker
 ```
 
-TP4 needs three workers. TP2 needs one worker.
+An existing container is **not deleted automatically**. Intentional replacement requires `REPLACE_CONTAINER=1`.
 
-```bash
-bash scripts/cluster_status.sh
-```
+TP4 needs three workers; TP2 needs one.
 
-## TP4
+### 7. Preflight the exact runtime
 
 ```bash
 bash scripts/preflight.sh 4
+# or
+bash scripts/preflight.sh 2
+```
+
+Preflight verifies the locked plugin/ExLlama revisions and ABI on every live Ray node. For a mounted local checkpoint it also runs the physical pack validator.
+
+### 8. First serve
+
+TP4:
+
+```bash
 bash scripts/serve_tp4.sh
 ```
 
-## TP2
+TP2:
 
-The remote 3.30-bpw source artifact is intentionally blocked by `serve_tp2.sh` until a validated layer-uniform repack exists. Use the recovery workflow above.
+```bash
+bash scripts/serve_tp2.sh
+```
 
-## Smoke test
+Both wrappers fail closed on remote/unvalidated source artifacts unless an explicit loader-development bypass is set.
+
+### 9. Deterministic smoke test
 
 ```bash
 bash scripts/smoke_test.sh
 ```
 
-## Dry-run command resolution
+The smoke test now fails unless `/v1/models` exposes the expected served model **and** the deterministic response content is exactly:
 
-```bash
-DRY_RUN=1 MAX_MODEL_LEN=8192 MAX_NUM_SEQS=1 bash scripts/serve_tp4.sh
+```text
+EXL3 Spark OK
 ```
 
-Always trust the **printed resolved command**, not the values you intended to pass.
+Pretty-printing a fluent but wrong response no longer counts as a pass.
 
----
+## TP4 qualification
 
-# Docker 29 image-ID trap
+The published 4.75-bpw pack is complete on HF, but its card explicitly describes **mixed K per tensor**. Current vLLM routed allocation remains one K per transformer layer. Therefore TP4 must pass `validate_pack.py --topology tp4` before runtime qualification.
 
-Moby issue [#51934](https://github.com/moby/moby/issues/51934) reports `docker load` yielding different image IDs across machines/storage integrations despite matching image content/layers.
-
-For cross-node identity, use:
+Once a compatible TP4 pack exists, use:
 
 ```bash
-bash scripts/image_fingerprint.sh /path/to/saved-image.tar
+bash scripts/tp4_min_fit.sh --check
+bash scripts/watch_cluster_memory.sh   # second terminal
+bash scripts/tp4_min_fit.sh
 ```
 
-Compare archive SHA256, complete RootFS layer list, storage driver, source revisions, and runtime identity. Do not reject a node solely because the short `docker images` ID differs.
+If the verified 8K/seq1 load still drives a Spark into the near-full unified-memory cliff during resident Engram load, record:
 
----
+```text
+RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
+```
 
-# Diagnostics
+and move to an explicitly identified nonresident/disk-backed Engram variant rather than another memory-knob sweep.
+
+See [`docs/TP4.md`](docs/TP4.md).
+
+## TP2 qualification
+
+TP2 is a separate checkpoint and memory target. The 4.75-bpw TP4 body is not a practical two-Spark body. The current TP2 SAGE source artifact also uses tensor-granular K2-K8 and must be repacked to one K per routed layer for the current vLLM loader.
+
+The intended short path is:
+
+```text
+original SAGE tensor-granular allocation
+        ↓
+coalesce one K per transformer layer
+        ↓
+reuse exact (tensor,K) encodes from the encode bank
+        ↓
+encode only missing deltas
+        ↓
+repack + fidelity/release checks
+```
+
+TP2 should use streamed/nonresident Engram and target actual final body bytes rather than trusting nominal bpw. 128K remains unverified.
+
+See [`docs/TP2.md`](docs/TP2.md).
+
+## Explicit profiles
+
+Qualification settings live in `profiles/`:
+
+- `profiles/tp4-minfit.env`
+- `profiles/tp4-64k.env`
+- `profiles/tp2-minfit.env`
+- `profiles/tp2-32k.env`
+
+The safe first-boot profile is also the default in `.env.example` and `runtime.lock.json`.
+
+## Reproducibility receipts
 
 ```bash
 bash scripts/runtime_identity.sh
+bash scripts/image_fingerprint.sh /path/to/saved-image.tar
 bash scripts/watch_cluster_memory.sh
 ```
 
-DGX Spark CPU and GPU share one coherent memory pool, so system `MemAvailable` is a primary capacity signal. CUDA free/total is shown for correlation, not as an independent memory pool.
+Do not use the short Docker image ID alone to prove cross-node identity on Docker 29. Compare archive SHA256, complete RootFS layer list, locked source revisions and runtime identity.
 
-Useful docs:
+## Useful docs
 
 - [`docs/TP4.md`](docs/TP4.md)
 - [`docs/TP2.md`](docs/TP2.md)
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)
-- [`docs/SM120_UVA.md`](docs/SM120_UVA.md)
-- [`docs/TONOKEN3_VALIDATION.md`](docs/TONOKEN3_VALIDATION.md)
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 
 ## License
 
-Recipe code authored in this repository is released under **AGPL-3.0-only**. Model weights, vLLM, ExLlamaV3, CUDA components, and container layers retain their own licenses.
+Recipe code authored in this repository is released under **AGPL-3.0-only**. Model weights, vLLM, ExLlamaV3, CUDA components and container layers retain their own licenses.
