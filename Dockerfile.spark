@@ -2,7 +2,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
 FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
-ARG VLLM_EXL3_REF=85358661df07efa6c3f48a4572cff92642fa08bb
+ARG VLLM_EXL3_REF=21fa627a3933d80de2d1030e732354d8c3cd761e
 ARG EXLLAMAV3_REF=be57335b087e4f001c5caae061544df3c06ba01e
 ARG TORCH_CUDA_ARCH_LIST=12.1a
 
@@ -59,9 +59,15 @@ abi = int(getattr(vllm_exl3_c, "P2B_MOE_ABI_VERSION", 0))
 diag = vllm_exl3.runtime_diagnostics()
 assert abi >= 3, f"expected EXL3 native MoE ABI >= 3, got {abi}"
 assert diag["mixed_k"]["config_bits"] == [2, 3, 4, 5, 6, 7, 8], diag["mixed_k"]
+assert diag["mixed_k"]["exllamav3_moe_kernel_bits"] == [1, 2, 3, 4, 5, 6, 7, 8], diag["mixed_k"]
+assert diag["mixed_k"]["native_qualified_bits"] == [2, 3, 4], diag["mixed_k"]
 assert diag["mixed_k"]["tensor_level_mixed_k_within_layer"] is False
+plan2 = vllm_exl3.plan_deepseek_v41(tensor_parallel_size=2, expert_parallel=True)
+assert plan2.local_experts == 192
+assert plan2.preferred_first_boot_backend == "exllamav3"
 print("vLLM:", vllm.__version__)
 print("vllm-exl3 ABI:", abi)
+print("TP2 plan:", plan2.to_dict())
 print("TORCH_CUDA_ARCH_LIST build target is provided by the image environment")
 print(diag)
 PY
