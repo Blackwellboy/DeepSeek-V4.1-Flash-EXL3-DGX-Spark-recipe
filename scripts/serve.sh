@@ -36,11 +36,12 @@ DSPARK="${DSPARK:-0}"
 EAGER="${EAGER:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
-# Topology default: TP4 starts from the ExLlamaV3 control. TP2 starts from the
-# ABI-3 native candidate because 192 local experts exceed the current
-# ExLlamaV3 fused-MoE 128-expert envelope.
+# Correctness-first default for both EP2 and EP4 is ExLlamaV3's fused/fallback
+# routed-expert path. ExLlamaV3 itself has K1-K8 fused MoE kernel instances and
+# is not limited to 128 total experts. The old >128 fallback in vllm-exl3 is a
+# per-expert token-count condition. ABI-3 native p2b stays an explicit K2-K4 A/B.
 if [[ -z "${NATIVE_MOE:-}" ]]; then
-  if [[ "$TP" == "2" ]]; then NATIVE_MOE=1; else NATIVE_MOE=0; fi
+  NATIVE_MOE=0
 fi
 
 EXEC_ENV=(
@@ -54,16 +55,13 @@ if is_true "$NATIVE_MOE"; then
     -e VLLM_EXL3_V41_NATIVE_MOE=1
     -e VLLM_EXL3_MOE_KERNEL=native
   )
-  BACKEND_LABEL="native-abi3"
+  BACKEND_LABEL="native-abi3-k2-k4-candidate"
 else
-  EXEC_ENV+=( -e VLLM_EXL3_V41_NATIVE_MOE=0 )
-  if [[ "$TP" == "4" ]]; then
-    EXEC_ENV+=( -e VLLM_EXL3_MOE_KERNEL=exllamav3 )
-    BACKEND_LABEL="exllamav3-control"
-  else
-    EXEC_ENV+=( -e VLLM_EXL3_MOE_KERNEL=auto )
-    BACKEND_LABEL="auto-fallback"
-  fi
+  EXEC_ENV+=(
+    -e VLLM_EXL3_V41_NATIVE_MOE=0
+    -e VLLM_EXL3_MOE_KERNEL=exllamav3
+  )
+  BACKEND_LABEL="exllamav3-control"
 fi
 
 ARGS=(
