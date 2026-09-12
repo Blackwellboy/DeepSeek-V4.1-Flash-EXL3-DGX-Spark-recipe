@@ -2,6 +2,10 @@
 
 TP2 is the aggressive target. Treat it as a separate checkpoint/memory problem rather than a smaller copy of TP4.
 
+**Published TP2 checkpoint:** [`vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw)
+
+With `MODEL=` left blank, `scripts/preflight.sh 2` and `scripts/serve_tp2.sh` select that repo through `MODEL_TP2` automatically.
+
 ## Geometry
 
 - 2 Spark nodes / 2 GB10 GPUs total
@@ -24,19 +28,17 @@ A GB10 has 128 GB coherent unified system memory and commonly exposes roughly 12
 
 The same 4.75-bpw pack can remain a diagnostic/bring-up attempt, but it should **not** be advertised as the normal TP2 recipe.
 
-## Recommended TP2 quantization target
+## TP2 quantization target
 
-Generate a separate TP2 EXL3 checkpoint and optimize to a **byte budget**, not only a nominal bpw.
+The published TP2 pack is a separate **SAGE 3.30-bpw** target rather than the TP4 4.75-bpw release. The important qualification number is still the **final non-PLE body bytes**, not the nominal average bpw alone.
 
-Recommended first target for the non-PLE body:
+Earlier planning targeted roughly:
 
-- **goal: 170-175 GiB total body**
+- **goal: 170-175 GiB total non-PLE body**
 - per Spark under TP2: **85-87.5 GiB/rank**
 - stretch ceiling for early experiments: about **180 GiB body / 90 GiB per rank**
 
-That leaves materially more unified-memory headroom for the runtime while still keeping Engram/PLE on NVMe.
-
-If size scaled perfectly linearly from the current 233 GiB / 4.75-bpw body, 170-175 GiB would correspond very roughly to **3.47-3.57 bpw**, and 180 GiB to about **3.67 bpw**. Treat those only as planning estimates: dense MXFP8 weights, embeddings, scales and other fixed-format tensors do not shrink linearly with the routed-expert EXL3 K schedule. SAGE should therefore target the final body byte size directly and spend precision on the most sensitive layers.
+Measure the published 3.30-bpw checkpoint directly before claiming those exact body numbers. Dense MXFP8 weights, embeddings, scales and other fixed-format tensors do not scale linearly with routed-expert EXL3 bitrate.
 
 ## CPU offload on DGX Spark
 
@@ -44,7 +46,7 @@ Do **not** rely on `--cpu-offload-gb` as the TP2 capacity solution.
 
 On a normal discrete-GPU server, vLLM CPU offload can increase effective GPU capacity because GPU VRAM and host RAM are separate physical pools. DGX Spark is different: Grace CPU and Blackwell GPU share the same 128 GB LPDDR5x coherent unified memory. vLLM's UVA offloader places parameters in pinned CPU memory and exposes accelerator views, but those pages still consume the same physical Spark memory pool.
 
-CPU/UVA offload may still be useful as an experimental access-policy or allocator test, but it does **not** turn a 116.5 GiB/rank checkpoint into a comfortably sized TP2 deployment. It is disabled in this recipe by default.
+CPU/UVA offload may still be useful as an experimental access-policy or allocator test, but it does **not** turn a too-large per-rank checkpoint into a comfortably sized TP2 deployment. It is disabled in this recipe by default.
 
 The useful capacity offload for V4.1 on Spark is **NVMe-backed data that is not kept resident**, especially the ~189 GiB Engram/PLE tables. Any additional NVMe/layer streaming variant must be documented and benchmarked separately because it can materially change latency and prefill throughput.
 
@@ -70,7 +72,7 @@ The TP2 wrapper defaults to `NATIVE_MOE=1` because ABI-3 p2b can represent 5120 
 Start conservative:
 
 ```bash
-GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 TEXT_ONLY=1 ./scripts/serve_tp2.sh
+GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 TEXT_ONLY=1 bash scripts/serve_tp2.sh
 ```
 
 This is still **experimental** until the full V4.1 geometry passes GB10 numerical parity and real-checkpoint serving.
@@ -78,7 +80,7 @@ This is still **experimental** until the full V4.1 geometry passes GB10 numerica
 For a conservative fallback/control attempt:
 
 ```bash
-NATIVE_MOE=0 GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 ./scripts/serve_tp2.sh
+NATIVE_MOE=0 GPU_MEMORY_UTILIZATION=0.75 DSPARK=0 EAGER=1 bash scripts/serve_tp2.sh
 ```
 
 With native disabled, the plugin may fall back to a slower applicable path. That is useful for correctness comparison but not a performance target.
