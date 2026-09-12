@@ -58,8 +58,7 @@ PY
 
 printf '%s\n' '=== Recipe settings ==='
 printf 'MODEL=%s\n' "${MODEL:-<lock-selected>}"
-printf 'MODEL_REVISION=%s\n' "${MODEL_REVISION:-<lock-selected>}
-"
+printf 'MODEL_REVISION=%s\n' "${MODEL_REVISION:-<lock-selected>}"
 printf 'MAX_MODEL_LEN=%s\n' "${MAX_MODEL_LEN:-$LOCK_MAX_MODEL_LEN}"
 printf 'GPU_MEMORY_UTILIZATION=%s\n' "${GPU_MEMORY_UTILIZATION:-$LOCK_GPU_MEMORY_UTILIZATION}"
 printf 'MAX_NUM_SEQS=%s\n' "${MAX_NUM_SEQS:-$LOCK_MAX_NUM_SEQS}"
