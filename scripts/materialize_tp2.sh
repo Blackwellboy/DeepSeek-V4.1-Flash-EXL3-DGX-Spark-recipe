@@ -19,7 +19,24 @@ REPO="${MODEL_TP2:-vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw}"
 MIN_FREE_GIB="${TP2_DOWNLOAD_MIN_FREE_GIB:-500}"
 mkdir -p "$DEST"
 
+# Keep all Hugging Face temporary/cache traffic on the same large filesystem by
+# default. Merely changing --local-dir is not enough if HF_HOME/Xet cache still
+# point at a nearly-full Spark root disk.
+TP2_HF_HOME="${TP2_HF_HOME:-$(dirname "$DEST")/.hf-tp2-cache}"
+export HF_HOME="$TP2_HF_HOME"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_XET_CACHE="${HF_XET_CACHE:-$HF_HOME/xet}"
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE"
+
 FREE_GIB="$(df -PB1 "$DEST" | awk 'NR==2 {printf "%.2f", $4/1024/1024/1024}')"
+CACHE_FS="$(df -P "$HF_HOME" | awk 'NR==2 {print $1}')"
+DEST_FS="$(df -P "$DEST" | awk 'NR==2 {print $1}')"
+if [[ "$CACHE_FS" != "$DEST_FS" ]]; then
+  echo "ERROR: TP2 HF cache ($HF_HOME) is not on the same filesystem as destination ($DEST)." >&2
+  echo "Set TP2_HF_HOME to a directory on the large model filesystem." >&2
+  exit 2
+fi
+
 python3 - "$FREE_GIB" "$MIN_FREE_GIB" <<'PY'
 import sys
 free = float(sys.argv[1]); need = float(sys.argv[2])
@@ -30,6 +47,9 @@ PY
 echo "=== TP2 Hugging Face materialization ==="
 echo "Repo:        $REPO"
 echo "Destination: $DEST"
+echo "HF_HOME:     $HF_HOME"
+echo "HF_HUB_CACHE:$HF_HUB_CACHE"
+echo "HF_XET_CACHE:$HF_XET_CACHE"
 echo "Free space:  $FREE_GIB GiB"
 echo
 
@@ -59,3 +79,4 @@ echo "TP2 snapshot is materially present at: $DEST"
 echo "Set on BOTH Sparks:"
 echo "  MODEL_DIR=$(dirname "$DEST")"
 echo "  MODEL=/models/$(basename "$DEST")"
+echo "  HF_HOME=$HF_HOME"
