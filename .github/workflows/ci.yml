@@ -26,20 +26,280 @@ jobs:
             python -m py_compile "$f"
           done
 
-      - name: JSON examples
-        run: python -m json.tool configs/quantization_config.example.json >/dev/null
-
-      - name: Pin integrity
+      - name: JSON and runtime-lock validation
         run: |
-          grep -q 'vllm/vllm-openai:deepseekv41-flash-0909' Dockerfile.spark
-          grep -q '21fa627a3933d80de2d1030e732354d8c3cd761e' Dockerfile.spark
-          grep -q 'be57335b087e4f001c5caae061544df3c06ba01e' Dockerfile.spark
-          grep -q 'P2B_MOE_ABI_VERSION' scripts/preflight.py
-          grep -q 'vcruz305/DSV4.1-Flash-EXL3-4.75bpw' .env.example
-          grep -q 'vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw' .env.example
-          grep -q 'config_bits.*2.*3.*4.*5.*6.*7.*8' Dockerfile.spark
-          grep -q 'exllamav3_moe_kernel_bits' Dockerfile.spark
-          grep -q 'preferred_first_boot_backend.*exllamav3' Dockerfile.spark
+          python -m json.tool configs/quantization_config.example.json >/dev/null
+          python -m json.tool runtime.lock.json >/dev/null
+          python scripts/runtime_lock.py validate
+
+      - name: Runtime lock is the single source of truth
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          lock = json.loads(Path("runtime.lock.json").read_text())
+          dockerfile = Path("Dockerfile.spark").read_text()
+          build = Path("scripts/build_runtime.sh").read_text()
+
+          def docker_arg(name):
+              match = re.search(rf"^ARG {re.escape(name)}=(.+)$", dockerfile, re.M)
+              assert match, f"missing Docker ARG {name}"
+              return match.group(1).strip()
+
+          assert docker_arg("BASE_IMAGE") == lock["base_image"]["ref"]
+          assert docker_arg("VLLM_EXL3_REPO") == lock["vllm_exl3"]["repo"]
+          assert docker_arg("VLLM_EXL3_REF") == lock["vllm_exl3"]["commit"]
+          assert docker_arg("EXLLAMAV3_REF") == lock["exllamav3"]["commit"]
+          assert docker_arg("TORCH_CUDA_ARCH_LIST") == lock["torch_cuda_arch_list"]
+
+          for needle in (
+              "runtime_lock.py",
+              "--build-arg VLLM_EXL3_REPO=",
+              "--build-arg VLLM_EXL3_REF=",
+              "--build-arg EXLLAMAV3_REF=",
+          ):
+              assert needle in build, f"build wrapper missing {needle}"
+
+          assert lock["first_boot"] == {
+              "max_model_len": 8192,
+              "gpu_memory_utilization": 0.75,
+              "max_num_seqs": 1,
+              "max_num_batched_tokens": 1024,
+              "text_only": True,
+              "dspark": False,
+              "eager": True,
+              "native_moe": False,
+          }
+          assert lock["capabilities"]["accepted_exl3_config_k"] == [2,3,4,5,6,7,8]
+          assert lock["capabilities"]["tensor_level_mixed_k_within_layer"] is False
+          PY
+
+      - name: No stale runtime facts
+        run: |
+          if grep -R --exclude-dir=.git -n '8f4517e80416466fa4a3ad2eb28685021d39e95f' .; then
+            echo 'stale pre-V4.1 plugin pin found' >&2
+            exit 1
+          fi
+          if grep -R --exclude-dir=.git -n '21fa627a3933d80de2d1030e732354d8c3cd761e' .; then
+            echo 'stale pre-PR9 plugin pin found' >&2
+            exit 1
+          fi
+          if grep -R -n '128-expert envelope' README.md docs scripts; then
+            echo 'stale total-expert ceiling wording found' >&2
+            exit 1
+          fi
+          if grep -R -n 'GPU_MEMORY_UTILIZATION:-0\.90' scripts; then
+            echo 'stale 0.90 first-boot default found' >&2
+            exit 1
+          fi
+
+      - name: Physical pack validator fixtures
+        run: |
+          python - <<'PY'
+          import json
+          import struct
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+
+          config = {
+              "architectures": ["DeepseekV41ForCausalLM"],
+              "model_type": "deepseek_v41",
+              "quantization_config": {
+                  "quant_method": "exl3",
+                  "codebook": "mcg",
+                  "mtp_experts": "source",
+                  "non_routed_quantization": {
+                      "quant_method": "deepseek_v4_fp8",
+                      "weight_block_size": [32, 32],
+                      "activation_scheme": "dynamic",
+                  },
+              },
+          }
+
+          def write_pack(root: Path, tensors: dict):
+              root.mkdir(parents=True, exist_ok=True)
+              (root / "config.json").write_text(json.dumps(config))
+              shard = root / "model-00001-of-00001.safetensors"
+              offset = 0
+              header = {}
+              payload = bytearray()
+              for name, (dtype, shape) in tensors.items():
+                  itemsize = {"I16": 2, "F16": 2, "F32": 4}[dtype]
+                  count = 1
+                  for dim in shape:
+                      count *= dim
+                  size = count * itemsize
+                  header[name] = {
+                      "dtype": dtype,
+                      "shape": shape,
+                      "data_offsets": [offset, offset + size],
+                  }
+                  payload.extend(bytes(size))
+                  offset += size
+              raw = json.dumps(header, separators=(",", ":")).encode()
+              raw += b" " * ((-len(raw)) % 8)
+              shard.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+              (root / "model.safetensors.index.json").write_text(json.dumps({
+                  "weight_map": {name: shard.name for name in tensors}
+              }))
+              return shard
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp) / "valid-k7"
+              write_pack(root, {
+                  "model.layers.0.ffn.experts.0.w1_trellis": ("I16", [1, 1, 112]),
+                  "model.layers.0.ffn.experts.0.w2_trellis": ("I16", [1, 1, 112]),
+              })
+              out = subprocess.check_output([
+                  "python", "scripts/validate_pack.py", str(root),
+                  "--topology", "tp2", "--reserve-gib", "0", "--json"
+              ], text=True)
+              report = json.loads(out)
+              assert report["deployable_with_current_pinned_loader"] is True, report
+              assert report["trellis_k_histogram"] == {"7": 2}, report
+              assert report["mixed_k_layers"] == {}, report
+              assert report["tensor_size_mismatches"] == [], report
+              assert len(report["shard_header_sha256"]) == 1, report
+
+              mixed = Path(tmp) / "mixed-layer"
+              write_pack(mixed, {
+                  "model.layers.0.ffn.experts.0.w1_trellis": ("I16", [1, 1, 32]),
+                  "model.layers.0.ffn.experts.0.w2_trellis": ("I16", [1, 1, 48]),
+              })
+              proc = subprocess.run([
+                  "python", "scripts/validate_pack.py", str(mixed),
+                  "--topology", "tp2", "--reserve-gib", "0", "--json"
+              ], text=True, capture_output=True)
+              assert proc.returncode == 2, proc.stdout + proc.stderr
+              report = json.loads(proc.stdout)
+              assert report["mixed_k_layers"], report
+              assert any("multiple physical K widths" in e for e in report["errors"]), report
+
+              pointer = Path(tmp) / "pointer"
+              shard = write_pack(pointer, {
+                  "model.layers.0.ffn.experts.0.w1_trellis": ("I16", [1, 1, 32]),
+              })
+              shard.write_text(
+                  "version https://git-lfs.github.com/spec/v1\n"
+                  "oid sha256:" + "0" * 64 + "\nsize 999\n"
+              )
+              proc = subprocess.run([
+                  "python", "scripts/validate_pack.py", str(pointer),
+                  "--topology", "tp2", "--reserve-gib", "0", "--json"
+              ], text=True, capture_output=True)
+              assert proc.returncode == 2
+              report = json.loads(proc.stdout)
+              assert report["bad_shards"][0]["status"] == "pointer", report
+
+              bad_size = Path(tmp) / "bad-size"
+              shard = write_pack(bad_size, {
+                  "model.layers.0.ffn.experts.0.w1_trellis": ("I16", [1, 1, 32]),
+              })
+              raw = shard.read_bytes()
+              header_len = struct.unpack("<Q", raw[:8])[0]
+              header = json.loads(raw[8:8+header_len])
+              key = next(iter(header))
+              header[key]["data_offsets"] = [0, 32]
+              new_header = json.dumps(header, separators=(",", ":")).encode()
+              new_header += b" " * ((-len(new_header)) % 8)
+              shard.write_bytes(struct.pack("<Q", len(new_header)) + new_header + bytes(64))
+              proc = subprocess.run([
+                  "python", "scripts/validate_pack.py", str(bad_size),
+                  "--topology", "tp2", "--reserve-gib", "0", "--json"
+              ], text=True, capture_output=True)
+              assert proc.returncode == 2
+              report = json.loads(proc.stdout)
+              assert report["tensor_size_mismatches"], report
+          PY
+
+      - name: Build wrapper forwards every locked build input
+        run: |
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/bin"
+          cat > "$tmp/bin/docker" <<'SH'
+          #!/usr/bin/env bash
+          printf '%q ' "$@" >> "$DOCKER_LOG"
+          printf '\n' >> "$DOCKER_LOG"
+          if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+            echo 'ID=fake RepoDigests=[]'
+          fi
+          exit 0
+          SH
+          chmod +x "$tmp/bin/docker"
+          export DOCKER_LOG="$tmp/docker.log"
+          PATH="$tmp/bin:$PATH" bash scripts/build_runtime.sh
+          python - "$DOCKER_LOG" <<'PY'
+          import json, sys
+          from pathlib import Path
+          lock = json.loads(Path('runtime.lock.json').read_text())
+          log = Path(sys.argv[1]).read_text()
+          expected = [
+              f"BASE_IMAGE={lock['base_image']['ref']}",
+              f"VLLM_EXL3_REPO={lock['vllm_exl3']['repo']}",
+              f"VLLM_EXL3_REF={lock['vllm_exl3']['commit']}",
+              f"EXLLAMAV3_REF={lock['exllamav3']['commit']}",
+              f"TORCH_CUDA_ARCH_LIST={lock['torch_cuda_arch_list']}",
+          ]
+          for item in expected:
+              assert item in log, f"missing build arg {item}\n{log}"
+          PY
+
+      - name: Cluster launcher safety matrix
+        run: |
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/bin"
+          cat > "$tmp/bin/docker" <<'SH'
+          #!/usr/bin/env bash
+          printf '%q ' "$@" >> "$DOCKER_LOG"
+          printf '\n' >> "$DOCKER_LOG"
+          if [[ "$1" == "image" && "$2" == "inspect" ]]; then exit 0; fi
+          if [[ "$1" == "container" && "$2" == "inspect" ]]; then
+            [[ "${FAKE_CONTAINER_EXISTS:-0}" == "1" ]] && exit 0 || exit 1
+          fi
+          if [[ "$1" == "run" ]]; then echo fake-container-id; fi
+          exit 0
+          SH
+          cat > "$tmp/bin/sleep" <<'SH'
+          #!/usr/bin/env bash
+          exit 0
+          SH
+          chmod +x "$tmp/bin/docker" "$tmp/bin/sleep"
+          export PATH="$tmp/bin:$PATH"
+          export DOCKER_LOG="$tmp/docker.log"
+          rdma="$tmp/infiniband"
+          touch "$rdma"
+
+          : > "$DOCKER_LOG"
+          HEAD_IP=10.0.0.1 NODE_IP=10.0.0.1 RDMA_DEVICE="$rdma" ENABLE_RDMA=auto \
+            bash scripts/start_cluster.sh head
+          grep -q -- '--device' "$DOCKER_LOG"
+
+          : > "$DOCKER_LOG"
+          HEAD_IP=10.0.0.1 NODE_IP=10.0.0.1 RDMA_DEVICE="$rdma" ENABLE_RDMA=0 \
+            bash scripts/start_cluster.sh head
+          if grep -q -- '--device' "$DOCKER_LOG"; then
+            echo 'ENABLE_RDMA=0 unexpectedly passed an RDMA device' >&2
+            exit 1
+          fi
+
+          rm -f "$rdma"
+          if HEAD_IP=10.0.0.1 NODE_IP=10.0.0.1 RDMA_DEVICE="$rdma" ENABLE_RDMA=1 \
+              bash scripts/start_cluster.sh head; then
+            echo 'ENABLE_RDMA=1 unexpectedly accepted a missing RDMA device' >&2
+            exit 1
+          fi
+
+          export FAKE_CONTAINER_EXISTS=1
+          if HEAD_IP=10.0.0.1 NODE_IP=10.0.0.1 ENABLE_RDMA=0 \
+              bash scripts/start_cluster.sh head; then
+            echo 'existing container was unexpectedly replaced without opt-in' >&2
+            exit 1
+          fi
 
       - name: Qualification harness integrity
         run: |
@@ -48,61 +308,31 @@ jobs:
           grep -q 'NATIVE_MOE=0' scripts/tp4_min_fit.sh
           grep -q 'DRY_RUN' scripts/serve.sh
           grep -q '_EXPLICIT_ENV' scripts/lib.sh
+          grep -q 'TP4_ALLOW_UNVALIDATED' scripts/serve_tp4.sh
           grep -q 'TP2_ALLOW_UNVALIDATED' scripts/serve_tp2.sh
-          grep -q 'hf download' scripts/materialize_tp2.sh
-          grep -q 'HF_XET_CACHE' scripts/materialize_tp2.sh
-          grep -q 'NATIVE_MOE=0' .env.example
+          grep -q 'ALLOW_SOURCE_ARTIFACT_DOWNLOAD' scripts/materialize_model.sh
+          grep -q 'SMOKE PASS' scripts/smoke_test.sh
+          grep -q 'REPLACE_CONTAINER' scripts/start_cluster.sh
+          grep -q 'ENABLE_RDMA' scripts/start_cluster.sh
 
-      - name: TP2 safetensors checker fixture
+      - name: Required files
         run: |
-          tmp="$(mktemp -d)"
-          python - "$tmp" <<'PY'
-          import json, struct, sys
-          from pathlib import Path
-          root = Path(sys.argv[1])
-          shard = root / "model-00001-of-00001.safetensors"
-          header = {
-              "model.layers.0.ffn.experts.0.w1_trellis": {
-                  "dtype": "I16", "shape": [1, 1, 32], "data_offsets": [0, 64]
-              }
-          }
-          raw = json.dumps(header, separators=(",", ":")).encode()
-          raw += b" " * ((-len(raw)) % 8)
-          shard.write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(64))
-          (root / "model.safetensors.index.json").write_text(json.dumps({
-              "weight_map": {"model.layers.0.ffn.experts.0.w1_trellis": shard.name}
-          }))
-          PY
-          python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 --json >/tmp/tp2-valid.json
-          python - <<'PY'
-          import json
-          report = json.load(open('/tmp/tp2-valid.json'))
-          assert report['deployable_with_current_pinned_loader'] is True, report
-          assert report['trellis_k_histogram'] == {'2': 1}, report
-          assert report['bad_shards'] == [], report
-          PY
-          python - "$tmp" <<'PY'
-          import sys
-          from pathlib import Path
-          root = Path(sys.argv[1])
-          shard = root / "model-00001-of-00001.safetensors"
-          shard.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0"*64 + "\nsize 999\n")
-          PY
-          if python scripts/check_tp2_pack.py "$tmp" --reserve-gib 0 >/tmp/tp2-pointer.txt 2>&1; then
-            echo "pointer fixture unexpectedly passed" >&2
-            exit 1
-          fi
-          grep -q 'pointer' /tmp/tp2-pointer.txt
-
-      - name: Required recipe files
-        run: |
+          test -f runtime.lock.json
           test -f docs/TP4.md
           test -f docs/TP2.md
           test -f docs/TROUBLESHOOTING.md
+          test -f scripts/runtime_lock.py
+          test -f scripts/validate_pack.py
+          test -f scripts/doctor.py
+          test -f scripts/doctor.sh
+          test -f scripts/materialize_model.sh
           test -f scripts/tp4_min_fit.sh
           test -f scripts/watch_ray_memory.py
           test -f scripts/image_fingerprint.sh
-          test -f scripts/check_tp2_pack.py
-          test -f scripts/materialize_tp2.sh
+          test -f scripts/smoke_test.sh
+          test -f profiles/tp4-minfit.env
+          test -f profiles/tp4-64k.env
+          test -f profiles/tp2-minfit.env
+          test -f profiles/tp2-32k.env
           test -f THIRD_PARTY_NOTICES.md
           test -f AGENTS.md
