@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed TP4 disk-Engram readiness probe across Ray nodes."""
+"""Fail-closed disk-Engram readiness probe across the exact Ray GPU topology."""
 from __future__ import annotations
 
 import json
@@ -86,6 +86,8 @@ def _probe(model_dir: str) -> dict[str, object]:
             errors.append("unexpected heterogeneous mixed-K dispatch contract")
         if mixed.get("cudagraph_qualified") is not False:
             errors.append("mixed-K qualification contract must remain eager-first")
+        if mixed.get("arena_prescan_guard_installed") is not True:
+            errors.append("mixed-K expert-placement prescan guard is missing")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"vllm-exl3 mixed-K runtime probe failed: {exc!r}")
 
@@ -108,12 +110,18 @@ def main() -> int:
         for node in ray.nodes()
         if node.get("Alive") and float(node.get("Resources", {}).get("GPU", 0)) >= 1
     ]
-    if len(nodes) < expected:
+    # A larger cluster is not harmless here: vLLM/Ray could place workers on a
+    # GPU node we did not probe. Qualification therefore requires the exact
+    # requested GPU-node topology, not merely at least TP nodes.
+    if len(nodes) != expected:
         print(
             json.dumps(
                 {
                     "ok": False,
-                    "error": f"Ray exposes {len(nodes)} live GPU nodes; expected {expected}",
+                    "error": (
+                        f"Ray exposes {len(nodes)} live GPU nodes; disk qualification "
+                        f"requires exactly {expected}"
+                    ),
                 },
                 indent=2,
             )
@@ -121,7 +129,7 @@ def main() -> int:
         return 2
 
     refs = []
-    for node in nodes[:expected]:
+    for node in nodes:
         node_id = str(node["NodeID"])
         refs.append(
             _probe.options(
