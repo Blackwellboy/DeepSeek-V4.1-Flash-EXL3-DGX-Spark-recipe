@@ -46,29 +46,47 @@ The required runtime overlay is therefore:
 
 This is supplied to vLLM through `--hf-overrides`; it is never written into the checkpoint directory.
 
-## Fail-closed identity binding
+## Fail-closed header-level identity binding
 
 The override is accepted only for `--strict-locked-snapshot` validation and only when all values in:
 
 `attestations/tp2-e831e9e4-metadata.json`
 
-match the local snapshot exactly, including:
+match the observed snapshot, including:
 
 - config SHA256;
-- 31 individual safetensors header SHA256 values;
+- 31 individual **raw safetensors header** SHA256 values;
 - index tensor count;
-- total indexed shard bytes;
+- total shard file bytes;
 - EXL3 K histogram;
 - codebook-marker counts;
-- locked model repo + immutable HF revision.
+- locked model repo + immutable HF revision in the recipe contract.
 
-Any mismatch keeps the original metadata errors and produces `DEPLOYABLE_CURRENT_LOADER=NO`.
+This is a **metadata/header attestation**, not a 446 GB payload checksum. It proves the runtime-format declarations are bound to the observed tensor names/dtypes/shapes/offsets in the safetensors headers. It does not claim that every tensor payload byte has been rehashed.
+
+Any attestation mismatch keeps the original metadata errors and produces `DEPLOYABLE_CURRENT_LOADER=NO`.
 
 Structural failures are never attestable. Missing/unindexed tensors, bad offsets, byte-size inconsistencies, unsupported K, malformed shards, or disk-reserve failure remain hard errors even when the metadata attestation matches.
 
-## Qualification commands
+## Remote provenance check
 
-Use the TP2-specific validator for the canonical snapshot:
+Before a hardware load, compare the checked-in header receipt directly with the immutable HF revision using Range requests only:
+
+```bash
+python3 scripts/probe_tp2_attestation.py
+```
+
+Require:
+
+```text
+REMOTE_METADATA_ATTESTATION=PASS
+```
+
+This downloads config/index JSON and only the header byte ranges of the 31 safetensors files. It refuses to use tensor payload downloads for this provenance check.
+
+## Local qualification commands
+
+Use the TP2-specific validator for the canonical local snapshot:
 
 ```bash
 python3 scripts/check_tp2_pack.py /path/to/DSV4.1-Flash-SAGE-EXL3-3.30bpw \
@@ -76,7 +94,7 @@ python3 scripts/check_tp2_pack.py /path/to/DSV4.1-Flash-SAGE-EXL3-3.30bpw \
   --strict-locked-snapshot
 ```
 
-Expected metadata lines for the canonical snapshot:
+Expected metadata lines for the attested snapshot:
 
 ```text
 Runtime metadata source: locked_snapshot_attestation
@@ -97,4 +115,4 @@ python3 scripts/check_tp2_pack.py /path/to/DSV4.1-Flash-SAGE-EXL3-3.30bpw \
 
 ## Scope
 
-Passing this gate means the exact canonical snapshot has a documented runtime metadata contract compatible with the pinned loader. It does **not** prove two-Spark capacity, disk-Engram performance, output correctness, long-context viability, or throughput. Those remain hardware qualification gates.
+Passing this gate means the exact observed header/layout identity has a documented runtime metadata contract compatible with the pinned loader. It does **not** prove full payload-byte integrity, two-Spark capacity, disk-Engram performance, output correctness, long-context viability, or throughput. Those remain separate qualification gates.
