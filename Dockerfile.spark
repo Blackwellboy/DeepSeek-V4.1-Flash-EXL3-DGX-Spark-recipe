@@ -2,7 +2,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
 FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
-ARG VLLM_EXL3_REF=5666d1b4a55ef2237797eaee60cbb042e933f375
+ARG VLLM_EXL3_REF=c69c8f8dda806ab19807a83506574fd391263cad
 ARG VLLM_EXL3_REPO=https://github.com/vcruz305/vllm-exl3.git
 ARG EXLLAMAV3_REF=be57335b087e4f001c5caae061544df3c06ba01e
 ARG TORCH_CUDA_ARCH_LIST=12.1a
@@ -77,6 +77,8 @@ assert diag["mixed_k"]["exllamav3_moe_kernel_bits"] == [1, 2, 3, 4, 5, 6, 7, 8],
 assert diag["mixed_k"]["native_qualified_bits"] == [2, 3, 4], diag["mixed_k"]
 assert diag["mixed_k"]["tensor_level_mixed_k_within_layer"] is True, diag["mixed_k"]
 assert diag["mixed_k"]["heterogeneous_dispatch"] == "python_loop", diag["mixed_k"]
+assert diag["mixed_k"]["fused_k_source"] == "physical_trellis_geometry", diag["mixed_k"]
+assert diag["mixed_k"]["physical_fused_k_guard_installed"] is True, diag["mixed_k"]
 assert diag["mixed_k"]["cudagraph_qualified"] is False, diag["mixed_k"]
 assert diag["mixed_k"]["arena_prescan_guard_installed"] is True, diag["mixed_k"]
 assert diag["tp_geometry"]["nested_moe_config_compat_installed"] is True, diag["tp_geometry"]
