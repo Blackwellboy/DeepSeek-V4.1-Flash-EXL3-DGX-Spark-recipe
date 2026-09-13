@@ -298,10 +298,13 @@ Qualification settings live in `profiles/`:
 
 - `profiles/tp4-minfit.env`
 - `profiles/tp4-64k.env`
+- `profiles/tp4-disk-engram.env` (experimental disk-backed Engram; not baseline)
 - `profiles/tp2-minfit.env`
 - `profiles/tp2-32k.env`
 
 The safe first-boot profile is also the default in `.env.example` and `runtime.lock.json`.
+
+After a resident-Engram `CAPACITY_FAIL` on GB10 UMA, use the explicit disk-backed path documented in [`docs/DISK_ENGRAM.md`](docs/DISK_ENGRAM.md) (`scripts/tp4_disk_engram_min_fit.sh`). Do not hide disk Engram inside the baseline serve scripts.
 
 ## Reproducibility receipts
 
@@ -317,6 +320,7 @@ Do not use the short Docker image ID alone to prove cross-node identity on Docke
 
 - [`docs/VALIDATION.md`](docs/VALIDATION.md)
 - [`docs/TP4.md`](docs/TP4.md)
+- [`docs/DISK_ENGRAM.md`](docs/DISK_ENGRAM.md)
 - [`docs/TP2.md`](docs/TP2.md)
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)

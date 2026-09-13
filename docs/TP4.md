@@ -168,3 +168,25 @@ V4.1 advertises much longer context, but practical Spark capacity is determined 
 ## Engram
 
 Resident Engram is a qualification experiment, not an assumption. Keep any disk/node-local Engram variant separately identified so EXL3 memory savings and Engram I/O costs remain measurable.
+
+### Resident Engram capacity evidence (GB10 UMA)
+
+Corrected min-fit (**8K / seq1**, eager, text-only) with resident Engram still drove Sparks into the unified-memory cliff:
+
+```text
+RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
+~121 GiB used / MemAvailable ~0.5 GiB class during Engram materialization
+```
+
+On GB10, `EngramConfig.cpu_offload` does not create physical capacity (CPU and GPU share one pool). After recording `CAPACITY_FAIL`, stop sweeping context/batch/memory-utilization knobs and move to an explicitly identified disk-backed path.
+
+### Disk-backed Engram (experimental)
+
+See [`DISK_ENGRAM.md`](DISK_ENGRAM.md) for the qualification profile, overlay provenance, offline gate PASS summary, OOM guard thresholds (WARN=24 GiB, ABORT=16 GiB), and the mixed-K `vllm-exl3` PR placeholder.
+
+```bash
+bash scripts/tp4_disk_engram_min_fit.sh --check
+bash scripts/tp4_disk_engram_min_fit.sh
+```
+
+Do not treat disk-backed Engram as the silent baseline for TP4 or TP2.
