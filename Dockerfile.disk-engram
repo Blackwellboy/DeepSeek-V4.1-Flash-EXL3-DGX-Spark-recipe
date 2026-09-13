@@ -29,20 +29,37 @@ for rel in files:
     shutil.copy2(source, target)
     print('overlay:', rel, '->', target)
 
-# PR #2 carried one typo in a non-default eager-loader comparison branch.
-# Correct it in the derived image and assert no stale spelling remains.
 weight_utils = dst / 'model_executor/model_loader/weight_utils.py'
 text = weight_utils.read_text(encoding='utf-8')
+
+# PR #2 carried one typo in a comparison-only eager branch. Correct it before
+# the derived image is accepted.
 text = text.replace('_adviseadvise_dontneed_path', '_fadvise_dontneed_path')
+
+# Disk mode depends on per-tensor safe_open filtering before get_tensor(). The
+# eager strategy materializes whole shards, torchao follows a different loading
+# path, and prefetch deliberately heats whole checkpoint files into page cache.
+# All three defeat or endanger the Spark non-residency contract, so reject them.
+needle = '    loading_desc = "Loading safetensors checkpoint shards"\n'
+guard = '''    if os.environ.get("VLLM_ENGRAM_DISK_BACKED", "0").strip().lower() in {"1", "true", "yes", "on"}:\n        if safetensors_load_strategy in {"eager", "torchao", "prefetch"}:\n            raise RuntimeError(\n                "disk-backed Engram requires the per-tensor safetensors iterator; "\n                f"safetensors_load_strategy={safetensors_load_strategy!r} is unsafe on GB10 UMA"\n            )\n\n'''
+if needle not in text:
+    raise SystemExit('ERROR: pinned weight_utils.py no longer matches disk-Engram overlay insertion point')
+text = text.replace(needle, guard + needle, 1)
 weight_utils.write_text(text, encoding='utf-8')
+
 if '_adviseadvise_dontneed_path' in text:
     raise SystemExit('ERROR: stale fadvise typo remains in disk-Engram overlay')
+if 'disk-backed Engram requires the per-tensor safetensors iterator' not in text:
+    raise SystemExit('ERROR: disk-Engram safetensors strategy guard was not installed')
 PY
 
-RUN python -m py_compile \
-      $(python - <<'PY'
+# Compile the overlaid Python files without relying on Dockerfile shell/heredoc
+# command-substitution edge cases.
+RUN python - <<'PY'
 from pathlib import Path
+import py_compile
 import vllm
+
 root = Path(vllm.__file__).resolve().parent
 for rel in (
     'config/engram.py',
@@ -50,26 +67,29 @@ for rel in (
     'models/deepseek_v4_1/common/engram_disk.py',
     'model_executor/model_loader/weight_utils.py',
 ):
-    print(root / rel)
+    path = root / rel
+    py_compile.compile(str(path), doraise=True)
+    print('compiled:', path)
 PY
-      )
 
 RUN python - <<'PY'
+import os
 import vllm
 import vllm_exl3
 from vllm.config.engram import EngramConfig
-from vllm.models.deepseek_v4_1.common.engram_disk import (
-    engram_disk_backed_enabled,
-    should_skip_engram_embed_tensor,
-)
+from vllm.models.deepseek_v4_1.common.engram_disk import should_skip_engram_embed_tensor
 
 vllm_exl3.register()
 diag = vllm_exl3.runtime_diagnostics()
 assert hasattr(EngramConfig, 'disk_backed'), 'EngramConfig.disk_backed missing'
-assert should_skip_engram_embed_tensor('layers.1.engram.embed.weight') is False
+os.environ['VLLM_ENGRAM_DISK_BACKED'] = '1'
+assert should_skip_engram_embed_tensor('layers.1.engram.embed.weight') is True
+assert should_skip_engram_embed_tensor('layers.1.engram.embed.scale') is True
 assert diag['mixed_k']['tensor_level_mixed_k_within_layer'] is True, diag['mixed_k']
+assert diag['mixed_k']['heterogeneous_dispatch'] == 'python_loop', diag['mixed_k']
 assert diag['mixed_k']['cudagraph_qualified'] is False, diag['mixed_k']
-print('disk Engram overlay import: OK')
+assert diag['mixed_k']['arena_prescan_guard_installed'] is True, diag['mixed_k']
+print('disk Engram overlay import/skip: OK')
 print('vLLM:', vllm.__version__)
 print('vllm-exl3 mixed-K:', diag['mixed_k'])
 PY
