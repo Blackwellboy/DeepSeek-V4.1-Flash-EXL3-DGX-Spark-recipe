@@ -11,8 +11,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from attested_pack import validate_pack_for_runtime
 from runtime_lock import load_lock
-from validate_pack import validate_pack
 
 
 def run(*cmd: str) -> dict[str, Any]:
@@ -116,16 +116,23 @@ def main() -> int:
         }
 
     local_model: Path | None = None
-    if args.model and args.model.startswith("/models/") and args.model_dir:
+    if args.model == "/models" and args.model_dir:
+        # Exact model directory mounted directly at /models.
+        local_model = Path(args.model_dir).expanduser()
+    elif args.model and args.model.startswith("/models/") and args.model_dir:
         local_model = Path(args.model_dir).expanduser() / Path(args.model).name
     elif args.model and Path(args.model).expanduser().is_dir():
         local_model = Path(args.model).expanduser()
 
     if local_model is not None and local_model.is_dir():
-        pack = validate_pack(local_model, topology, args.reserve_gib)
+        pack = validate_pack_for_runtime(local_model, topology, args.reserve_gib)
         report["physical_pack"] = pack
         if not pack["deployable_with_current_pinned_loader"]:
             errors.extend(f"pack: {item}" for item in pack["errors"])
+            errors.extend(
+                f"pack attestation: {item}"
+                for item in pack.get("metadata_attestation_mismatches", [])
+            )
     else:
         report["physical_pack"] = None
         warnings.append(
