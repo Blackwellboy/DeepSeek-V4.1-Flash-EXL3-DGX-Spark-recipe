@@ -169,6 +169,28 @@ class MetadataAttestationTests(unittest.TestCase):
             )
             self.assertFalse(result["deployable_with_current_pinned_loader"])
 
+    def test_checked_in_attestation_is_bound_to_runtime_lock(self):
+        lock = json.loads((ROOT / "runtime.lock.json").read_text(encoding="utf-8"))
+        contract = lock["models"]["tp2"]
+        att_path = ROOT / contract["runtime_metadata_attestation"]
+        attestation = json.loads(att_path.read_text(encoding="utf-8"))
+        self.assertEqual(attestation["model_repo"], contract["repo_id"])
+        self.assertEqual(attestation["revision"], contract["revision"])
+        self.assertEqual(len(attestation["shard_header_sha256"]), contract["expected_shards"])
+        self.assertEqual(attestation["index_tensor_count"], 188245)
+        self.assertEqual(attestation["materialized_shard_bytes"], 446440212472)
+        qcfg = attestation["runtime_hf_overrides"]["quantization_config"]
+        self.assertEqual(qcfg["quant_method"], "exl3")
+        self.assertEqual(qcfg["mtp_experts"], "source")
+        self.assertEqual(
+            qcfg["non_routed_quantization"],
+            {
+                "quant_method": "deepseek_v4_fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [32, 32],
+            },
+        )
+
 
 class RuntimeWiringTests(unittest.TestCase):
     def test_serve_uses_hf_overrides_as_one_array_argument(self):
