@@ -34,6 +34,8 @@ class RecipeContractTests(unittest.TestCase):
         self.assertEqual(arg("VLLM_EXL3_REF"), self.lock["vllm_exl3"]["commit"])
         self.assertEqual(arg("EXLLAMAV3_REF"), self.lock["exllamav3"]["commit"])
         self.assertEqual(arg("TORCH_CUDA_ARCH_LIST"), self.lock["torch_cuda_arch_list"])
+        self.assertIn("physical_fused_k_guard_installed", dockerfile)
+        self.assertIn('fused_k_source"] == "physical_trellis_geometry"', dockerfile)
 
     def test_first_boot_and_mixed_k_contract(self) -> None:
         self.assertEqual(self.lock["first_boot"]["max_model_len"], 8192)
@@ -47,6 +49,7 @@ class RecipeContractTests(unittest.TestCase):
         self.assertTrue(caps["tensor_level_mixed_k_within_layer"])
         self.assertEqual(caps["routed_allocation_scope"], "per_expert_exact_trellis_shapes")
         self.assertEqual(caps["heterogeneous_mixed_k_dispatch"], "linear_exl3_python_loop")
+        self.assertEqual(caps["uniform_k_fused_k_source"], "physical_trellis_geometry")
         self.assertFalse(caps["heterogeneous_mixed_k_cudagraph_qualified"])
         self.assertEqual(caps["mixed_k_first_boot"], "eager")
 
@@ -168,6 +171,7 @@ class RecipeContractTests(unittest.TestCase):
             "scripts/build_disk_engram_runtime.sh",
             "scripts/start_disk_engram_cluster.sh",
             "scripts/check_disk_engram_cluster.py",
+            "scripts/check_oom_guards.sh",
             "scripts/tp4_disk_engram_min_fit.sh",
             "scripts/oom_guard.sh",
             "scripts/watch_oom_guard.sh",
@@ -180,6 +184,7 @@ class RecipeContractTests(unittest.TestCase):
         self.assertIn("EAGER=1", profile)
         launcher = (ROOT / "scripts/tp4_disk_engram_min_fit.sh").read_text()
         self.assertIn("check_disk_engram_cluster.py 4", launcher)
+        self.assertIn("check_oom_guards.sh", launcher)
         serve = (ROOT / "scripts/serve.sh").read_text()
         self.assertIn("VLLM_EXL3_MODEL_DIR", serve)
 
@@ -188,6 +193,7 @@ class RecipeContractTests(unittest.TestCase):
             "8f4517e80416466fa4a3ad2eb28685021" + "d39e95f",
             "21fa627a3933d80de2d1030e732354d8" + "c3cd761e",
             "ee8c2c171bbe0d036a3accb24a76af5" + "a95506748",
+            "5666d1b4a55ef2237797eaee60cbb042" + "e933f375",
         ]
         offenders: list[str] = []
         for path in ROOT.rglob("*"):
