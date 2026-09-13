@@ -1406,21 +1406,58 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
+def _find_containing_vma(addr: int):
+    """Return (vma_start, vma_end, pathname) for addr from /proc/self/maps."""
+    try:
+        with open("/proc/self/maps", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if not parts:
+                    continue
+                span = parts[0]
+                if "-" not in span:
+                    continue
+                lo_s, hi_s = span.split("-", 1)
+                lo, hi = int(lo_s, 16), int(hi_s, 16)
+                if lo <= addr < hi:
+                    path = parts[-1] if len(parts) >= 6 and parts[-1].startswith("/") else ""
+                    return lo, hi, path
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _madv_dontneed_cpu_tensor(src: torch.Tensor) -> None:
-    """Drop COW/private pages of a consumed CPU source after H2D (GB10 UMA)."""
+    """Drop COW pages of a consumed *tensor view* after H2D (GB10 UMA).
+
+    Uses the VIEW byte span (``data_ptr`` + numel*element_size), never the
+    base ``untyped_storage()`` span — advising the storage can discard pages
+    of later unconsumed fused-shard views. Bounded to the containing
+    ``*.safetensors`` VMA; non-contiguous and heap mappings are skipped.
+    """
     if os.environ.get("VLLM_SAFETENSORS_MADV_AFTER_H2D", "1") == "0":
         return
     if not torch.is_tensor(src) or src.device.type != "cpu" or src.numel() == 0:
         return
+    if not src.is_contiguous():
+        return
     try:
-        ptr = int(src.untyped_storage().data_ptr())
-        nbytes = int(src.untyped_storage().nbytes())
-        if ptr == 0 or nbytes <= 0:
+        view_start = int(src.data_ptr())
+        view_nbytes = int(src.numel()) * int(src.element_size())
+        if view_start == 0 or view_nbytes <= 0:
             return
+        view_end = view_start + view_nbytes
+        vma = _find_containing_vma(view_start)
+        if vma is None:
+            return
+        vma_lo, vma_hi, vma_path = vma
+        if not vma_path.endswith(".safetensors"):
+            return
+        safe_start = max(view_start, vma_lo)
+        safe_end = min(view_end, vma_hi)
         page = os.sysconf("SC_PAGESIZE")
-        # Interior pages only — never round outward into adjacent heap.
-        start = ptr + ((page - (ptr % page)) % page)
-        end = (ptr + nbytes) - ((ptr + nbytes) % page)
+        start = safe_start + ((page - (safe_start % page)) % page)
+        end = safe_end - (safe_end % page)
         if end <= start:
             return
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
