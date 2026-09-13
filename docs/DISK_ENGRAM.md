@@ -1,71 +1,154 @@
-# Disk-backed Engram qualification (experimental)
+# Disk-backed Engram qualification
 
-Disk-backed / node-local Engram is an **explicit experimental variable**, not part of the resident TP4 baseline. Keep EXL3 memory savings and Engram I/O costs measurable and separate.
+Disk-backed Engram is the current **TP4 DGX Spark capacity path**. It remains isolated from the baseline image so storage/I/O costs stay explicit and measurable.
 
-Profile: [`profiles/tp4-disk-engram.env`](../profiles/tp4-disk-engram.env)  
-Launcher: [`scripts/tp4_disk_engram_min_fit.sh`](../scripts/tp4_disk_engram_min_fit.sh)  
-Overlay (optional apply): [`overlays/disk-engram/`](../overlays/disk-engram/)
+## Why
 
-## Why resident Engram fails on GB10 UMA
-
-On DGX Spark / GB10, CPU and GPU share one physical unified-memory pool (~121–128 GiB MemTotal class). Resident Engram (GPU or pinned-CPU/`cpu_offload`) still materializes the large PLE embed tables into that same pool alongside the EXL3 body.
-
-Hardware evidence summary from corrected **8K / seq1** min-fit attempts with resident Engram:
+Corrected resident testing at 8K / seq1 / eager / text-only produced:
 
 ```text
 RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
-topology: TP4+EP4, eager, text-only, DSpark=0, native MoE=0
-context/batch: max_model_len=8192, max_num_seqs=1, max_num_batched_tokens=1024
-observation: MemAvailable collapses toward ~0.5 GiB; host ~121 GiB used;
-             SSH / node responsiveness can wedge near the UMA cliff
+~121 GiB used class
+~0.5 GiB MemAvailable class near the failure cliff
 ```
 
-`EngramConfig.cpu_offload=True` does **not** create physical capacity on GB10 UMA: pinned host placement still consumes the shared pool. Prefer `disk_backed` for Spark qualification after recording `CAPACITY_FAIL`.
+On GB10, pinned host memory and GPU memory consume the same physical LPDDR5x pool, so `cpu_offload=True` does not solve this capacity problem.
 
-## Disk-backed gates (unit / parity / stress)
+## What the disk path does
 
-With a runtime that implements `EngramConfig.disk_backed` (see `overlays/disk-engram/`), offline qualification gates observed:
+The overlay:
 
-| Gate | Result | Notes |
-|---|---|---|
-| Synthetic lookup parity | PASS | Disk path vs resident path on synthetic rows |
-| Real-slice parity | PASS_BIT_EXACT | Real checkpoint slice, bit-exact agreement |
-| Engram stress / reclaim | PASS | Repeated lookups; MemAvailable stayed ~116 GiB class with bounded staging; swap unused |
+- does **not** allocate the full Engram embedding table as a resident Parameter;
+- skips full `engram.embed.weight/scale` materialization in the weight iterator;
+- keeps the safetensors backing on node-local storage;
+- stages only unique rows required for the current lookup into bounded pinned-host and GPU buffers;
+- reuses vLLM's FP8/ue8m0 Engram dequant semantics;
+- keeps disk mode explicit through `EngramConfig.disk_backed` / `VLLM_ENGRAM_DISK_BACKED=1`.
 
-These gates prove storage/lookup correctness under disk-backed mode. They are **not** a full TP4 serve throughput claim and do not replace smoke tests after a successful load.
+Offline/hardware qualification reported by @Blackwellboy:
 
-## Runtime requirements
+| Gate | Result |
+|---|---|
+| synthetic lookup parity | PASS |
+| real checkpoint slice | PASS, bit-exact |
+| repeated staging/reclaim stress | PASS |
+| TP ownership checks | PASS |
+| resident full Engram | not materialized |
 
-1. Image-pinned DeepSeek V4.1 vLLM must expose `EngramConfig.disk_backed` (stock image may not). Apply [`overlays/disk-engram/`](../overlays/disk-engram/) to the pinned site-packages or rebuild with the same pin.
-2. Export `VLLM_ENGRAM_DISK_BACKED=1` into Ray workers (container start env) and pass `--engram-config {"cpu_offload":false,"disk_backed":true}` on serve (profile sets `EXTRA_VLLM_ARGS`).
-3. Backing files must be **node-local NVMe** (fail closed on unsuitable filesystems in the overlay).
-4. Arm the OOM guard before load:
+Those are storage-path results, **not** a full-model serving claim.
+
+## Mixed-K dependency
+
+The companion mixed-K work is no longer a placeholder. `vllm-exl3` PR #10 by @Blackwellboy is merged and pinned through `runtime.lock.json`.
+
+The loader retains exact per-expert/per-projection K3–K8 trellis geometry. Heterogeneous layers use a correctness-first `LinearEXL3` loop and stay eager-first until CUDA-graph qualification exists.
+
+## Build
+
+Build the locked baseline first, then the derived disk image:
 
 ```bash
-OOM_GUARD_HOSTS="spark-a spark-b spark-c spark-d" \
-  OOM_GUARD_WARN_GIB=24 OOM_GUARD_ABORT_GIB=16 \
-  bash scripts/watch_oom_guard.sh start
+bash scripts/build_runtime.sh
+bash scripts/build_disk_engram_runtime.sh
 ```
 
-5. Then:
+Output image:
+
+```text
+deepseek-v41-exl3:disk-engram
+```
+
+`Dockerfile.disk-engram` applies only the explicit overlay files to the already locked Spark runtime and performs import/syntax assertions. Manual site-packages editing is no longer the recommended path.
+
+## Materialize the TP4 snapshot
+
+```bash
+ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
+  bash scripts/materialize_model.sh 4 /large/models/DSV4.1-Flash-EXL3-TP4
+```
+
+Use the same in-container path on every Spark, for example:
+
+```text
+/models/DSV4.1-Flash-EXL3-TP4
+```
+
+## Start all four Ray nodes in disk mode
+
+Example head:
+
+```bash
+IMAGE=deepseek-v41-exl3:disk-engram \
+MODEL_DIR=/large/models \
+MODEL=/models/DSV4.1-Flash-EXL3-TP4 \
+VLLM_ENGRAM_MODEL_DIR=/models/DSV4.1-Flash-EXL3-TP4 \
+HEAD_IP=10.0.0.10 NODE_IP=10.0.0.10 \
+  bash scripts/start_disk_engram_cluster.sh head
+```
+
+Run `worker` on the other three nodes. The wrapper ensures disk-Engram and EXL3 model-path environment exists in each Ray container before vLLM workers are created.
+
+## All-node preflight
+
+The first-load wrapper invokes:
+
+```text
+scripts/check_disk_engram_cluster.py
+```
+
+and fails unless every selected Ray GPU node has:
+
+- disk mode enabled;
+- matching model/index path;
+- overlay import available;
+- Engram weight-loader skip active;
+- mixed-K-capable plugin;
+- non-network backing storage.
+
+## OOM guard
+
+Default thresholds:
+
+```text
+WARN:  24 GiB MemAvailable
+ABORT: 16 GiB MemAvailable
+```
+
+The guard targets **one exact configured container name**. It no longer pattern-matches arbitrary `dsv41*` or `deepseek-v41*` containers.
+
+Arm it on every node before a real load.
+
+## First load
 
 ```bash
 bash scripts/tp4_disk_engram_min_fit.sh --check
 bash scripts/tp4_disk_engram_min_fit.sh
 ```
 
-## Mixed-K capability (separate PR)
+This path is locked to:
 
-Published TP4 packs may use tensor-granular mixed K. Current `vllm-exl3` routed allocation remains one physical K per `RoutedExperts` transformer layer unless a mixed-K / arena loader lands upstream.
+```text
+8K / seq1 / 1024 batched tokens
+text-only
+eager
+DSpark off
+native MoE off
+disk-backed Engram
+```
 
-**Placeholder:** mixed-K loadability depends on a separate `vllm-exl3` PR — link TBD when published (`https://github.com/vcruz305/vllm-exl3/pull/NNN`). Do not fold arena/mixed-K plugin code into this recipe branch.
+The launcher preserves caller overrides over profile/`.env` values, but it intentionally does **not** allow the correctness-critical first-boot toggles above to drift.
 
-## `.env` precedence note
+## Release evidence still required
 
-Shell-prefix overrides must win over recipe `.env` values. That precedence bug was independently reproduced during qualification and is **already fixed** in [`scripts/lib.sh`](../scripts/lib.sh) on main. This branch does not re-implement that fix.
+Before TP4 is called deployable:
 
-## What this branch is not
+1. all-node disk preflight passes;
+2. NCCL collective passes;
+3. full checkpoint load completes;
+4. `/v1/models` is ready;
+5. deterministic `scripts/smoke_test.sh` passes;
+6. per-node memory receipts prove full Engram stays non-resident;
+7. no UMA guard trip;
+8. repeated short decode is stable.
 
-- Not a silent change to TP2 or resident TP4 baselines.
-- Not a vendor of `vllm-exl3` arena / mixed-K plugin code (track that as a separate plugin PR).
-- Not a throughput or long-context publication by itself.
+Only then qualify larger context, DSpark and CUDA graphs separately.
