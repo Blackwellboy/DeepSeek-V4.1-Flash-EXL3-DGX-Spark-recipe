@@ -1,192 +1,163 @@
 # TP4 + EP4: four DGX Sparks
 
-This is the preferred DeepSeek-V4.1-Flash EXL3 **runtime qualification topology**, but the currently published 4.75-bpw HF artifact must first pass the physical loader-contract gate.
+This is the preferred DeepSeek-V4.1-Flash EXL3 runtime qualification topology.
 
-**Published TP4 artifact:** [`vcruz305/DSV4.1-Flash-EXL3-4.75bpw`](https://huggingface.co/vcruz305/DSV4.1-Flash-EXL3-4.75bpw)
+**Published artifact:** `vcruz305/DSV4.1-Flash-EXL3-4.75bpw`
 
 ## Geometry
 
 - 4 Spark nodes / 4 GB10 GPUs total
-- vLLM tensor parallel size: 4
+- tensor parallel size: 4
 - expert parallel: enabled
-- 384 main routed experts -> **96 whole experts per rank**
-- expert hidden/intermediate: **5120 × 2304** on every rank
-- top-k routing: 6
+- 384 routed experts -> **96 whole experts per rank**
+- expert matrix: **5120 × 2304**
+- top-k: 6
 
-Both expert dimensions are compatible with the current EXL3 execution geometry. There is no 128-total-expert ceiling in ExLlamaV3's fused MoE path.
+There is no 128-total-expert ExLlamaV3 ceiling.
 
 ## Gate 0: physical checkpoint compatibility
 
-The published TP4 model card describes **mixed K per tensor**. Current `vllm-exl3` routed allocation is still **one K per `RoutedExperts` transformer layer**. A complete HF upload is therefore not, by itself, proof that the pack is directly loadable by this vLLM integration.
-
-Materialize the exact locked HF revision onto a large filesystem only when intentionally validating the source artifact:
+The published checkpoint uses heterogeneous K3–K8 **inside routed layers and even across `w1/w2/w3` of one expert**. The pinned `vllm-exl3` now stores exact per-expert/per-projection trellis shapes, so this layout no longer requires a layer-uniform repack.
 
 ```bash
 ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
   bash scripts/materialize_model.sh 4 /large/models/DSV4.1-Flash-EXL3-TP4
-```
 
-Then require:
-
-```bash
 python3 scripts/validate_pack.py \
   /large/models/DSV4.1-Flash-EXL3-TP4 \
   --topology tp4 \
   --reserve-gib 32
 ```
 
-and:
+Require:
 
 ```text
 DEPLOYABLE_CURRENT_LOADER=YES
 ```
 
-The validator checks shard materialization, index/header agreement, safetensors offsets, dtype/shape byte counts, EXL3 K geometry, and whether each routed transformer layer has one physical K.
+That proves the **pack/loader contract**, not full hardware deployment.
 
-If routed layers contain more than one K, the short-term runtime fix is a **layer-uniform SAGE compatibility repack** that preserves mixed precision across layers while coalescing K inside each routed layer. Do not bypass the shape mismatch hard-fail for production inference.
+The heterogeneous path is correctness-first `LinearEXL3` execution and is not CUDA-graph-qualified yet. First boot must stay eager.
 
-`TP4_ALLOW_UNVALIDATED=1` exists only for loader-development experiments.
+## Gate 1: runtime identity and transport
 
-## Gate 1: exact runtime identity
-
-Every Spark must run the same locked runtime:
+Every Spark must use the same locked runtime and model revision.
 
 ```bash
 bash scripts/doctor.sh 4
 bash scripts/runtime_identity.sh
+bash scripts/preflight.sh 4
+bash scripts/cluster_collective.sh 4
 ```
 
-The canonical plugin, ExLlamaV3 revision, ABI and model revision come from `runtime.lock.json`.
+The collective must pass before model load.
 
-## Gate 2: resident-Engram minimum fit
+## Gate 2: resident Engram is already a known capacity failure
 
-Once a compatible local TP4 pack exists, prove the model can fit at all with large-context and batch pressure removed.
-
-First verify the resolved command without loading the model:
-
-```bash
-bash scripts/tp4_min_fit.sh --check
-```
-
-The launch must show:
-
-```text
-Max model len:          8192
-Max num seqs:           1
-Max batched tokens:     1024
-Native V4.1 MoE:        0
-DSpark:                 0
-Eager:                  1
-Text only:              1
-```
-
-Monitor all four nodes from another terminal:
-
-```bash
-bash scripts/watch_cluster_memory.sh
-```
-
-Then run:
-
-```bash
-bash scripts/tp4_min_fit.sh
-```
-
-### Capacity decision
-
-If the true 8K/seq1 run loads and serves, resident TP4 is technically viable and larger contexts/batches can be qualified separately.
-
-If the verified run still drives a Spark into the near-full unified-memory cliff during Engram load and a node becomes unresponsive, record:
+Corrected resident min-fit testing at **8K / seq1 / eager / text-only / DSpark-off / native-off** drove the GB10 unified-memory pool into the near-full cliff:
 
 ```text
 RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
+~121 GiB used class / ~0.5 GiB MemAvailable class during Engram materialization
 ```
 
-At that point stop tuning context/batch/memory-utilization and move to an explicitly identified nonresident/disk-backed Engram variant.
-
-## Baseline after min-fit passes
-
-Start with the correctness control:
+Do not use resident Engram as the normal qualification gate anymore. `scripts/tp4_min_fit.sh` is retained only for an explicit regression reproduction:
 
 ```bash
-NATIVE_MOE=0 DSPARK=0 EAGER=1 TEXT_ONLY=1 bash scripts/serve_tp4.sh
+ALLOW_RESIDENT_ENGRAM_RETEST=1 bash scripts/tp4_min_fit.sh
 ```
 
-Required evidence before moving on:
+On Spark, pinned-host/UVA Engram does not create physical capacity because CPU and GPU share the same memory pool.
 
-- all four Ray GPU resources visible;
-- 96 routed experts owned per main-stack rank;
-- source-format non-routed weights delegated correctly;
-- DSpark/source blocks are not mistaken for main EXL3 experts;
-- deterministic smoke test passes exactly;
-- per-rank unified-memory high-water mark captured;
-- actual EXL3 backend dispatch recorded;
-- no persistent dense reconstruction of the full routed expert bank.
+## Gate 3: build and start the disk-Engram runtime
 
-## Native p2b A/B
-
-Only after the ExLlamaV3 control is correct:
+Build the baseline and explicit derivative:
 
 ```bash
-NATIVE_MOE=1 DSPARK=0 EAGER=1 TEXT_ONLY=1 bash scripts/serve_tp4.sh
+bash scripts/build_runtime.sh
+bash scripts/build_disk_engram_runtime.sh
 ```
 
-The custom native path remains limited to qualified K2-K4 cases. Hold checkpoint revision, prompt, sampling, context and batch fixed when comparing.
+Start every node with the same materialized checkpoint path. The dedicated cluster wrapper propagates disk-Engram and mixed-K prescan environment into the Ray processes before vLLM launches.
 
-## DSpark
-
-After the non-speculative baseline is stable:
+Example head:
 
 ```bash
-DSPARK=1 NATIVE_MOE=0 EAGER=1 bash scripts/serve_tp4.sh
+IMAGE=deepseek-v41-exl3:disk-engram \
+MODEL_DIR=/large/models \
+MODEL=/models/DSV4.1-Flash-EXL3-TP4 \
+VLLM_ENGRAM_MODEL_DIR=/models/DSV4.1-Flash-EXL3-TP4 \
+HEAD_IP=10.0.0.10 NODE_IP=10.0.0.10 \
+  bash scripts/start_disk_engram_cluster.sh head
 ```
 
-Record proposed tokens, accepted tokens, mean accepted length and output speed. Do not infer DSpark value from decode speed alone.
+Use `worker` on the other three Sparks.
 
-## CUDA graphs
+## Gate 4: all-node disk preflight and first load
 
-Only after eager mode works:
+Arm the OOM guard on every node. The guard is bound to one exact configured container name and uses WARN=24 GiB / ABORT=16 GiB by default.
 
-```bash
-EAGER=0 bash scripts/serve_tp4.sh
-```
-
-Warm all required kernels before interpreting graph performance.
-
-## Context progression
-
-The safe first-boot profile is 8K. Increase only with measured memory headroom:
-
-1. 8,192
-2. 65,536
-3. 131,072
-4. 300,000
-5. longer only after explicit qualification
-
-V4.1 advertises much longer context, but practical Spark capacity is determined by the exact weights, Engram policy, graphs, workspaces, batch and KV behavior.
-
-## Engram
-
-Resident Engram is a qualification experiment, not an assumption. Keep any disk/node-local Engram variant separately identified so EXL3 memory savings and Engram I/O costs remain measurable.
-
-### Resident Engram capacity evidence (GB10 UMA)
-
-Corrected min-fit (**8K / seq1**, eager, text-only) with resident Engram still drove Sparks into the unified-memory cliff:
-
-```text
-RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
-~121 GiB used / MemAvailable ~0.5 GiB class during Engram materialization
-```
-
-On GB10, `EngramConfig.cpu_offload` does not create physical capacity (CPU and GPU share one pool). After recording `CAPACITY_FAIL`, stop sweeping context/batch/memory-utilization knobs and move to an explicitly identified disk-backed path.
-
-### Disk-backed Engram (experimental)
-
-See [`DISK_ENGRAM.md`](DISK_ENGRAM.md) for the qualification profile, overlay provenance, offline gate PASS summary, OOM guard thresholds (WARN=24 GiB, ABORT=16 GiB), and the mixed-K `vllm-exl3` PR placeholder.
+Then:
 
 ```bash
 bash scripts/tp4_disk_engram_min_fit.sh --check
 bash scripts/tp4_disk_engram_min_fit.sh
 ```
 
-Do not treat disk-backed Engram as the silent baseline for TP4 or TP2.
+Before load, the launcher probes all four Ray GPU nodes and requires:
+
+- `VLLM_ENGRAM_DISK_BACKED=1`;
+- the same local model/index path;
+- disk-Engram overlay import;
+- weight-loader Engram skip active;
+- mixed-K-capable `vllm-exl3`;
+- non-network backing storage.
+
+The first load is locked to:
+
+```text
+context:              8192
+max seqs:             1
+max batched tokens:   1024
+text only:            yes
+DSpark:               off
+native MoE:           off
+eager:                on
+Engram:               node-local disk-backed
+```
+
+## Gate 5: serving correctness
+
+A successful load is not enough. Require:
+
+```bash
+bash scripts/smoke_test.sh
+```
+
+and exact response:
+
+```text
+EXL3 Spark OK
+```
+
+Also capture:
+
+- `/v1/models` ready;
+- 96 owned experts/rank;
+- actual mixed-K dispatch;
+- per-rank unified-memory high-water mark;
+- full Engram non-residency evidence;
+- no dense reconstruction of the routed expert bank.
+
+## After the baseline passes
+
+Only then qualify independently:
+
+1. larger context (32K/64K/128K from measured headroom);
+2. DSpark;
+3. uniform-K fused/native A/B where eligible;
+4. CUDA graphs **only after a mixed-K graph-safe path is implemented/qualified**.
+
+Do not infer 128K viability from the disk-Engram parity tests alone.
+
+See [`DISK_ENGRAM.md`](DISK_ENGRAM.md) for the storage path and overlay details.
