@@ -4,7 +4,7 @@
 #
 # Defaults for disk-backed Engram / TP4 load experiments:
 #   WARN_GIB=24  ABORT_GIB=16
-# Abort stops only containers matching CONTAINER_MATCH (recipe default: dsv41-exl3).
+# Abort targets one exact container name only (recipe default: dsv41-exl3).
 set -euo pipefail
 
 HOSTNAME_S="$(hostname -s)"
@@ -18,7 +18,7 @@ WARN_GIB="${OOM_GUARD_WARN_GIB:-24}"
 ABORT_GIB="${OOM_GUARD_ABORT_GIB:-16}"
 # Swap growth: record WARN if SwapFree drops by this many GiB from baseline.
 SWAP_GROW_GIB="${OOM_GUARD_SWAP_GROW_GIB:-2}"
-CONTAINER_MATCH="${OOM_GUARD_CONTAINER_MATCH:-dsv41-exl3}"
+TARGET_CONTAINER="${OOM_GUARD_CONTAINER_NAME:-dsv41-exl3}"
 SYNTHETIC_TEST="${OOM_GUARD_SYNTHETIC_TEST:-0}"
 DRY_ABORT="${OOM_GUARD_DRY_ABORT:-0}"
 
@@ -37,17 +37,17 @@ gib_from_kb() {
 }
 
 list_target_containers() {
-  # Only recipe / EXL3 campaign containers; never touch unrelated services.
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^${CONTAINER_MATCH}$|^${CONTAINER_MATCH}-|^ray-.*${CONTAINER_MATCH}" || true
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(dsv41|deepseek-v41)' || true
+  # Never pattern-match unrelated DeepSeek jobs. A guard that can stop/kill a
+  # container must be bound to one exact recipe container name.
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$TARGET_CONTAINER" || true
 }
 
 abort_local_targets() {
   local reason="$1"
   local names
-  names="$(list_target_containers | sort -u | tr '\n' ' ')"
+  names="$(list_target_containers | tr '\n' ' ')"
   if [[ -z "${names// }" ]]; then
-    echo "$(ts) ABORT_NO_TARGET reason=$reason names=NONE"
+    echo "$(ts) ABORT_NO_TARGET reason=$reason name=$TARGET_CONTAINER"
     return 0
   fi
   echo "$(ts) ABORT_STOPPING reason=$reason names=$names dry=$DRY_ABORT"
@@ -55,13 +55,10 @@ abort_local_targets() {
     echo "$(ts) DRY_ABORT=YES skipped docker stop"
     return 0
   fi
-  # shellcheck disable=SC2086
-  docker stop -t 5 $names || true
-  for n in $names; do
-    if docker ps --format '{{.Names}}' | grep -qx "$n"; then
-      docker kill "$n" || true
-    fi
-  done
+  docker stop -t 5 "$TARGET_CONTAINER" || true
+  if docker ps --format '{{.Names}}' | grep -Fxq "$TARGET_CONTAINER"; then
+    docker kill "$TARGET_CONTAINER" || true
+  fi
 }
 
 write_receipt() {
@@ -82,7 +79,7 @@ write_receipt() {
     echo "Cached_kB=$cached_kb"
     echo "WARN_GIB=$WARN_GIB"
     echo "ABORT_GIB=$ABORT_GIB"
-    echo "CONTAINER_MATCH=$CONTAINER_MATCH"
+    echo "TARGET_CONTAINER=$TARGET_CONTAINER"
     echo "TARGETS=$(list_target_containers | tr '\n' ',')"
     echo "--- /proc/meminfo subset ---"
     grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Active\(file\)|Inactive\(file\)|Dirty|Writeback|AnonPages|Mapped|Shmem):' /proc/meminfo
@@ -99,6 +96,7 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 echo $$ >"$PID_FILE"
+trap 'rm -f "$PID_FILE"' EXIT
 
 BASE_SWAP_FREE_KB="$(read_meminfo SwapFree)"
 {
@@ -108,13 +106,14 @@ BASE_SWAP_FREE_KB="$(read_meminfo SwapFree)"
   echo "OOM_GUARD_HOST=$HOSTNAME_S"
   echo "OOM_GUARD_PID=$$"
   echo "OOM_GUARD_STARTED=$(ts)"
-  echo "OOM_GUARD_CONTAINER_MATCH=$CONTAINER_MATCH"
+  echo "OOM_GUARD_CONTAINER_NAME=$TARGET_CONTAINER"
   echo "OOM_GUARD_SYNTHETIC_TEST=$SYNTHETIC_TEST"
 } >"$STATE_FILE"
 
-echo "$(ts) ARMED host=$HOSTNAME_S warn=${WARN_GIB}GiB abort=${ABORT_GIB}GiB poll=${POLL_SEC}s synthetic=$SYNTHETIC_TEST dry=$DRY_ABORT"
+echo "$(ts) ARMED host=$HOSTNAME_S warn=${WARN_GIB}GiB abort=${ABORT_GIB}GiB poll=${POLL_SEC}s target=$TARGET_CONTAINER synthetic=$SYNTHETIC_TEST dry=$DRY_ABORT"
 
-warned=0
+warned_mem=0
+warned_swap=0
 while true; do
   mem_avail_kb="$(read_meminfo MemAvailable)"
   swap_free_kb="$(read_meminfo SwapFree)"
@@ -130,12 +129,12 @@ while true; do
 
   need_abort="$(awk -v a="$mem_avail_gib" -v t="$ABORT_GIB" 'BEGIN{print (a<t)?1:0}')"
   need_warn="$(awk -v a="$mem_avail_gib" -v t="$WARN_GIB" 'BEGIN{print (a<t)?1:0}')"
-  swap_abort="$(awk -v d="$swap_delta_gib" -v t="$SWAP_GROW_GIB" 'BEGIN{print (d>=t)?1:0}')"
+  swap_warn="$(awk -v d="$swap_delta_gib" -v t="$SWAP_GROW_GIB" 'BEGIN{print (d>=t)?1:0}')"
 
-  if [[ "$need_warn" == "1" && "$warned" == "0" ]]; then
+  if [[ "$need_warn" == "1" && "$warned_mem" == "0" ]]; then
     write_receipt WARN "MemAvailable_below_${WARN_GIB}GiB" "$mem_avail_kb" "$swap_free_kb" "$cached_kb" >/dev/null
     echo "$(ts) WARN MemAvailable=${mem_avail_gib}GiB"
-    warned=1
+    warned_mem=1
   fi
 
   if [[ "$need_abort" == "1" ]]; then
@@ -144,25 +143,15 @@ while true; do
     echo "OOM_GUARD_TRIGGERED=YES" >>"$STATE_FILE"
     echo "OOM_GUARD_TRIGGER_RECEIPT=$receipt" >>"$STATE_FILE"
     echo "$(ts) HARD_ABORT done receipt=$receipt"
-    rm -f "$PID_FILE"
     exit 2
   fi
 
-  # Swap growth with MemAvailable still above the hard abort threshold is
-  # recorded as a WARN only. Safetensors/page-cache load can touch swap while
-  # tens of GiB remain reclaimable; the UMA cliff is MemAvailable < ABORT_GIB.
-  if [[ "$swap_abort" == "1" && "$need_abort" == "1" ]]; then
-    receipt="$(write_receipt ABORT "Swap_growth_${swap_delta_gib}GiB_and_MemAvailable_below_${ABORT_GIB}GiB" "$mem_avail_kb" "$swap_free_kb" "$cached_kb")"
-    abort_local_targets "SwapGrowth=${swap_delta_gib}GiB>=${SWAP_GROW_GIB} with MemAvailable=${mem_avail_gib}GiB"
-    echo "OOM_GUARD_TRIGGERED=YES" >>"$STATE_FILE"
-    echo "OOM_GUARD_TRIGGER_RECEIPT=$receipt" >>"$STATE_FILE"
-    echo "$(ts) HARD_ABORT_SWAP done receipt=$receipt"
-    rm -f "$PID_FILE"
-    exit 3
-  elif [[ "$swap_abort" == "1" && "$warned" == "0" ]]; then
+  # Swap growth by itself is evidence, not a kill condition. The hard stop is
+  # MemAvailable crossing the explicit UMA abort threshold above.
+  if [[ "$swap_warn" == "1" && "$warned_swap" == "0" ]]; then
     write_receipt WARN "Swap_growth_${swap_delta_gib}GiB" "$mem_avail_kb" "$swap_free_kb" "$cached_kb" >/dev/null
     echo "$(ts) WARN SwapGrowth=${swap_delta_gib}GiB MemAvailable=${mem_avail_gib}GiB"
-    warned=1
+    warned_swap=1
   fi
 
   sleep "$POLL_SEC"
