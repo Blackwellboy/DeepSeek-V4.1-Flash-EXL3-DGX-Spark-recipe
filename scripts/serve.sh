@@ -45,6 +45,7 @@ EAGER="${EAGER:-$LOCK_EAGER}"
 DRY_RUN="${DRY_RUN:-0}"
 NATIVE_MOE="${NATIVE_MOE:-$LOCK_NATIVE_MOE}"
 DISK_ENGRAM="${VLLM_ENGRAM_DISK_BACKED:-0}"
+HF_OVERRIDES_JSON="${HF_OVERRIDES_JSON:-}"
 MOE_PARALLEL_MODE="${MOE_PARALLEL_MODE:-ep}"
 MOE_PARALLEL_MODE="$(printf '%s' "$MOE_PARALLEL_MODE" | tr '[:upper:]' '[:lower:]')"
 if [[ "$MOE_PARALLEL_MODE" != "ep" && "$MOE_PARALLEL_MODE" != "tp" ]]; then
@@ -126,6 +127,23 @@ if [[ -n "$MODEL_REVISION_RESOLVED" ]]; then
   ARGS+=( --revision "$MODEL_REVISION_RESOLVED" )
 fi
 
+# vLLM supports runtime Hugging Face config overrides. This is used only after
+# the TP2 canonical snapshot passes its immutable metadata attestation; it does
+# not modify config.json or any model shard on disk.
+if [[ -n "$HF_OVERRIDES_JSON" && "$HF_OVERRIDES_JSON" != "{}" ]]; then
+  if ! python3 - "$HF_OVERRIDES_JSON" <<'PY'
+import json, sys
+value = json.loads(sys.argv[1])
+if not isinstance(value, dict):
+    raise SystemExit(2)
+PY
+  then
+    echo "ERROR: HF_OVERRIDES_JSON is not valid JSON object data." >&2
+    exit 2
+  fi
+  ARGS+=( --hf-overrides "$HF_OVERRIDES_JSON" )
+fi
+
 if is_true "$TEXT_ONLY"; then
   ARGS+=( --language-model-only )
 else
@@ -159,6 +177,7 @@ Model:                  $MODEL
 Model revision:         ${MODEL_REVISION_RESOLVED:-<local-or-unpinned-override>}
 Served name:            $SERVED_MODEL_NAME
 EXL3 backend variant:   $BACKEND_LABEL
+Runtime HF override:    $( [[ -n "$HF_OVERRIDES_JSON" && "$HF_OVERRIDES_JSON" != "{}" ]] && echo attested || echo none )
 Native V4.1 MoE:        $NATIVE_MOE
 Disk-backed Engram:     $DISK_ENGRAM
 Engram model dir:       ${VLLM_ENGRAM_MODEL_DIR:-<resident-or-unset>}
