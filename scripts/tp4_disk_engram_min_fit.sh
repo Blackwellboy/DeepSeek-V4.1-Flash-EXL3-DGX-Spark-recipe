@@ -109,17 +109,27 @@ Fail-closed gates before model load:
   2. every node has the exact local checkpoint/index at the same container path;
   3. every node imports EngramConfig.disk_backed + the weight-loader skip;
   4. every node has the mixed-K-capable vllm-exl3 runtime;
-  5. node-local backing is not a network filesystem.
+  5. node-local backing is not a network filesystem;
+  6. every Spark host has a live exact-container UMA guard (real load only).
 ========================================================================
 EOF
 
 echo "Running all-node disk-Engram preflight..." >&2
 docker exec "$CONTAINER_NAME" \
   python /recipe/scripts/check_disk_engram_cluster.py 4 "$VLLM_ENGRAM_MODEL_DIR"
-
 echo "DISK_ENGRAM_CLUSTER_PREFLIGHT=PASS" >&2
 
-echo "Reminder: arm scripts/watch_oom_guard.sh on every node before a real load." >&2
+if [[ "$DRY" == "0" ]]; then
+  if is_true "${SKIP_OOM_GUARD_CHECK:-0}"; then
+    echo "WARNING: SKIP_OOM_GUARD_CHECK=1; real load is proceeding without verified host guards." >&2
+  else
+    export OOM_GUARD_CONTAINER_NAME="${OOM_GUARD_CONTAINER_NAME:-$CONTAINER_NAME}"
+    echo "Verifying four host-side UMA guards..." >&2
+    "$SCRIPT_DIR/check_oom_guards.sh" 4
+  fi
+else
+  echo "DRY_RUN: host OOM guards are not required for command/preflight inspection." >&2
+fi
 
 exec env \
   MODEL="$MODEL_RESOLVED" \
