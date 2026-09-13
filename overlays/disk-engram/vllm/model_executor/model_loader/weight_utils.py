@@ -752,6 +752,31 @@ def _fadvise_dontneed_path(path: str) -> None:
             pass
 
 
+_BOUNCE_STATS = {"tensors": 0, "bytes": 0}
+
+
+def _detach_from_safetensors_mmap(src: torch.Tensor) -> torch.Tensor:
+    """Anonymous CPU copy so later CUDA H2D cannot GUP-COW the file MAP_PRIVATE.
+
+    Measured on GB10: ``dest.copy_(get_tensor(...))`` turns safetensors
+    MAP_PRIVATE pages into Anonymous COW that accumulates across a shard.
+    CPU ``empty_like`` + ``copy_`` first keeps file VMAs Private_Clean and
+    lets ``safe_open`` munmap cleanly. One tensor at a time (not whole-file).
+
+    Default OFF: full TP4 showed bounce copies retained (~90GiB RssAnon)
+    while cuda_a stayed flat through the shard loop. Prefer post-H2D
+    ``madvise(MADV_DONTNEED)`` on the source tensor in the weight loader.
+    Enable with ``VLLM_SAFETENSORS_BOUNCE=1`` only for bounded debug.
+    """
+    if os.environ.get("VLLM_SAFETENSORS_BOUNCE", "0") != "1":
+        return src
+    out = torch.empty(src.shape, dtype=src.dtype, device="cpu")
+    out.copy_(src)
+    _BOUNCE_STATS["tensors"] += 1
+    _BOUNCE_STATS["bytes"] += int(src.nbytes)
+    return out
+
+
 def _get_fs_type(files: list[str]) -> str:
     """Get the filesystem type of the first file in *files* (Linux only)."""
     if not files:
@@ -1033,18 +1058,96 @@ def safetensors_weights_iterator(
                             continue
                     except Exception:  # noqa: BLE001
                         pass
-                    param = f.get_tensor(name)
+                    raw = f.get_tensor(name)
+                    # Detach from MAP_PRIVATE safetensors pages before H2D.
+                    param = _detach_from_safetensors_mmap(raw)
+                    del raw
                     yield name, param
                     del param
             # Drop page-cache for this consumed shard so GB10 MemAvailable
             # reflects reclaimable file cache instead of pinning it hot.
             _fadvise_dontneed_path(st_file)
             gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:  # noqa: BLE001
+                pass
             if torch.cuda.is_available():
                 try:
                     torch.cuda.empty_cache()
                 except Exception:  # noqa: BLE001
                     pass
+            _maybe_trace_load_mem(st_file)
+
+
+def _maybe_trace_load_mem(st_file: str) -> None:
+    """Optional per-shard host memory receipt (VLLM_LOAD_MEM_TRACE=1)."""
+    if os.environ.get("VLLM_LOAD_MEM_TRACE", "0") != "1":
+        return
+    try:
+        out_path = os.environ.get(
+            "VLLM_LOAD_MEM_TRACE_PATH", "/tmp/vllm_load_mem_trace.log"
+        )
+        fields: dict[str, float] = {}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                k, _, rest = line.partition(":")
+                if k in (
+                    "MemAvailable",
+                    "AnonPages",
+                    "Cached",
+                    "Active(file)",
+                    "Inactive(file)",
+                    "Mapped",
+                    "MemFree",
+                ):
+                    fields[k] = int(rest.split()[0]) / (1024.0 * 1024.0)
+        rss = anon = 0.0
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) / (1024.0 * 1024.0)
+                elif line.startswith("RssAnon:"):
+                    anon = int(line.split()[1]) / (1024.0 * 1024.0)
+        cuda_a = cuda_r = 0.0
+        if torch.cuda.is_available():
+            cuda_a = torch.cuda.memory_allocated() / (1024**3)
+            cuda_r = torch.cuda.memory_reserved() / (1024**3)
+        # Model safetensors VMA Anonymous (the COW signal)
+        vma_anon = 0.0
+        vma_n = 0
+        try:
+            cur_pn = ""
+            with open("/proc/self/smaps", encoding="utf-8") as fh:
+                for line in fh:
+                    if line and (
+                        line[0].isdigit()
+                        or (line[0] in "0123456789abcdef" and "-" in line[:20])
+                    ):
+                        parts = line.strip().split()
+                        cur_pn = parts[-1] if len(parts) >= 6 else ""
+                    elif line.startswith("Anonymous:") and ".safetensors" in cur_pn:
+                        vma_anon += int(line.split()[1]) / (1024.0 * 1024.0)
+                        vma_n += 1
+        except Exception:  # noqa: BLE001
+            pass
+        line = (
+            f"shard={os.path.basename(st_file)} "
+            f"Avail={fields.get('MemAvailable', 0):.2f} "
+            f"Anon={fields.get('AnonPages', 0):.2f} "
+            f"Cached={fields.get('Cached', 0):.2f} "
+            f"ActiveF={fields.get('Active(file)', 0):.2f} "
+            f"Mapped={fields.get('Mapped', 0):.2f} "
+            f"Rss={rss:.2f} RssAnon={anon:.2f} "
+            f"cuda_a={cuda_a:.2f} cuda_r={cuda_r:.2f} "
+            f"vma_anon_GiB={vma_anon:.3f} vma_n={vma_n} "
+            f"bounce_n={_BOUNCE_STATS.get('tensors', 0)} "
+            f"bounce_gi={_BOUNCE_STATS.get('bytes', 0) / (1024**3):.3f}\n"
+        )
+        with open(out_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -1303,6 +1406,30 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
+def _madv_dontneed_cpu_tensor(src: torch.Tensor) -> None:
+    """Drop COW/private pages of a consumed CPU source after H2D (GB10 UMA)."""
+    if os.environ.get("VLLM_SAFETENSORS_MADV_AFTER_H2D", "1") == "0":
+        return
+    if not torch.is_tensor(src) or src.device.type != "cpu" or src.numel() == 0:
+        return
+    try:
+        ptr = int(src.untyped_storage().data_ptr())
+        nbytes = int(src.untyped_storage().nbytes())
+        if ptr == 0 or nbytes <= 0:
+            return
+        page = os.sysconf("SC_PAGESIZE")
+        # Interior pages only — never round outward into adjacent heap.
+        start = ptr + ((page - (ptr % page)) % page)
+        end = (ptr + nbytes) - ((ptr + nbytes) % page)
+        if end <= start:
+            return
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), 4)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
@@ -1318,6 +1445,12 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             )
 
             param.data.copy_(loaded_weight)
+        if param.device.type == "cuda":
+            try:
+                torch.cuda.current_stream().synchronize()
+            except Exception:  # noqa: BLE001
+                pass
+            _madv_dontneed_cpu_tensor(loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
