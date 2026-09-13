@@ -4,11 +4,12 @@
 The physical pack validator intentionally requires mixed-format delegation metadata
 in ``config.json``. Some already-published canonical snapshots predate that
 contract. Rather than mutate those model files or globally relax validation, this
-module permits a runtime-only metadata override only when the *entire locked
-snapshot identity* matches a checked-in attestation.
+module permits a runtime-only metadata override only when the locked snapshot's
+header/layout identity matches a checked-in attestation.
 
 A changed config, shard header, tensor count, shard byte count, K histogram, or
-codebook-marker count immediately invalidates the attestation.
+codebook-marker count immediately invalidates the attestation. This is not a full
+tensor-payload checksum; payload integrity remains a separate concern.
 """
 from __future__ import annotations
 
@@ -64,7 +65,7 @@ def attestation_mismatches(
     result: dict[str, Any],
     config_sha256: str,
 ) -> list[str]:
-    """Return every immutable snapshot identity mismatch."""
+    """Return every header/layout identity mismatch."""
     mismatches: list[str] = []
 
     def check(name: str, observed: Any, expected: Any) -> None:
@@ -178,3 +179,37 @@ def validate_pack_with_locked_metadata(
     result["runtime_hf_overrides"] = overrides
     result["deployable_with_current_pinned_loader"] = not result["errors"]
     return result
+
+
+def validate_pack_for_runtime(
+    model_dir: Path,
+    topology: str,
+    reserve_gib: float,
+) -> dict[str, Any]:
+    """Validate a runtime candidate without penalizing corrected local repacks.
+
+    First run generic validation. A self-describing pack that already carries the
+    full metadata contract passes as-is, regardless of shard count. Only when TP2
+    fails on attestable legacy metadata do we rerun in strict locked-snapshot mode
+    and attempt the immutable header/layout attestation.
+    """
+    generic = validate_pack(model_dir, topology, reserve_gib)
+    if generic.get("deployable_with_current_pinned_loader"):
+        generic["metadata_contract_source"] = "checkpoint"
+        generic["metadata_attestation_match"] = False
+        generic["metadata_attestation_mismatches"] = []
+        generic["runtime_hf_overrides"] = {}
+        return generic
+    if topology != "tp2":
+        return generic
+    metadata_errors = {
+        error for error in generic.get("errors", []) if error in ATTESTABLE_METADATA_ERRORS
+    }
+    if not metadata_errors:
+        return generic
+    return validate_pack_with_locked_metadata(
+        model_dir,
+        topology,
+        reserve_gib,
+        strict_locked_snapshot=True,
+    )
