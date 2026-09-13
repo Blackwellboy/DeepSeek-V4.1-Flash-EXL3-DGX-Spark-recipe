@@ -59,4 +59,15 @@ DGX Spark, CUDA, NVIDIA drivers and container runtime components are proprietary
 
 ## Community Spark work
 
-Other public DeepSeek V4.1 Spark experiments may use disk-backed Engram, FlashInfer SM12x patches, indexer changes or JIT prebuilds. This baseline intentionally does not copy those patches. If a future recipe variant adopts code or a patch from another project, add the exact source commit/file and license here before merging it.
+Other public DeepSeek V4.1 Spark experiments may use disk-backed Engram, FlashInfer SM12x patches, indexer changes or JIT prebuilds. The **baseline** recipe intentionally does not bake those patches into the default image. Experimental overlays must remain explicitly opt-in.
+
+## Experimental overlay: `overlays/disk-engram/`
+
+Optional qualification overlay (not the silent baseline) adapting Apache-2.0 vLLM Engram / weight-loader code for node-local NVMe non-resident Engram on GB10 UMA:
+
+- `overlays/disk-engram/vllm/config/engram.py` — adds `EngramConfig.disk_backed`
+- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram.py` — disk-backed wiring
+- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram_disk.py` — new staging/backing helper (Apache-2.0; reuses pinned vLLM dequant semantics; not TonoKen3 source)
+- `overlays/disk-engram/vllm/model_executor/model_loader/weight_utils.py` — Apache-2.0 vLLM `weight_utils.py` with Engram embed skip + `posix_fadvise` DONTNEED for disk-backed loads
+
+Apply only against the image-pinned DeepSeek V4.1 runtime documented in `runtime.lock.json` / `overlays/disk-engram/README.md`. Upstream vLLM license: Apache-2.0 (https://github.com/vllm-project/vllm).
