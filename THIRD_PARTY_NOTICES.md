@@ -29,7 +29,7 @@ The exact upstream source commit represented by the dedicated image tag has not 
 ## vllm-exl3
 
 - Project: https://github.com/vcruz305/vllm-exl3
-- Pinned revision: `5666d1b4a55ef2237797eaee60cbb042e933f375`
+- Pinned revision: `c69c8f8dda806ab19807a83506574fd391263cad`
 - License: AGPL-3.0-only plus historical/third-party notices in that repository.
 
 ### PR #9 — @fattchris
@@ -54,7 +54,13 @@ GitHub records the original PR as merged. It contributed the core **per-expert/p
 - synthetic mixed-K/loader/arena regression tests;
 - 4× DGX Spark evidence that loading proceeded beyond the former 64-vs-48 trellis failure.
 
-Mainline hardening added after that contribution explicitly marks heterogeneous mixed-K as eager-first/not CUDA-graph-qualified and disables arena prescan for non-linear/EPLB expert placement.
+Mainline hardening after that contribution:
+
+- marks heterogeneous mixed-K eager-first/not CUDA-graph-qualified;
+- disables arena prescan for non-linear/EPLB expert placement;
+- derives fused uniform-layer K from the **loaded physical trellis geometry**, so a physically uniform K5/K7 layer cannot be launched using a stale config/base K.
+
+Those follow-up maintainer changes do not rewrite or squash @Blackwellboy's original merged commit; it remains in `main` ancestry.
 
 ## GB10 build / RoCE contribution — @fattchris
 
@@ -83,10 +89,11 @@ Mainline hardening on top of that contribution adds:
 - a reproducible derived `Dockerfile.disk-engram` instead of manual site-packages editing;
 - all-node Ray disk-Engram preflight;
 - propagation of disk mode/model path into Ray workers and the vLLM process;
-- exact-container OOM guard targeting;
+- exact-container OOM guard targeting and four-host guard verification;
 - caller/profile precedence protection;
 - eager-first mixed-K qualification contract;
-- retirement of resident Engram as the normal TP4 first gate.
+- retirement of resident Engram as the normal TP4 first gate;
+- rejection of whole-shard eager/prefetch/torchao loading strategies in disk mode.
 
 ### Overlay files
 
