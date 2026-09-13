@@ -1,50 +1,69 @@
-# overlays/disk-engram (experimental)
+# Disk-Engram vLLM overlay
 
-Runtime overlay that adds **disk-backed Engram** to an image-pinned DeepSeek V4.1 vLLM install. This is **not** part of the recipe baseline image build.
+This directory contains the **experimental node-local disk-backed Engram overlay** contributed in recipe PR #2 by **@Blackwellboy** and hardened during mainline integration.
 
-## Contents
+Original contributor commit:
+
+```text
+65c160e565fa4f0a01e55f433ab5868207f04401
+```
+
+The overlay is derived from the DeepSeek V4.1 vLLM code shipped by the recipe's locked base image:
+
+```text
+vllm/vllm-openai:deepseekv41-flash-0909
+```
+
+The exact upstream vLLM source commit represented by that image tag is not asserted here because it has not been independently resolved. Do not invent or substitute one. Re-qualify this overlay whenever the base image changes.
+
+## Files
 
 | Path | Role |
 |---|---|
-| `vllm/config/engram.py` | Adds `EngramConfig.disk_backed` (+ GB10 UMA note on `cpu_offload`) |
-| `vllm/models/deepseek_v4_1/common/engram_disk.py` | Node-local NVMe backing, bounded row staging, skip helpers |
-| `vllm/models/deepseek_v4_1/common/engram.py` | Wires disk-backed path into ParallelEngramEmbedding |
-| `vllm/model_executor/model_loader/weight_utils.py` | Skips full `engram.embed.{weight,scale}` materialization; `posix_fadvise` DONTNEED after consume |
+| `vllm/config/engram.py` | adds `EngramConfig.disk_backed` |
+| `vllm/models/deepseek_v4_1/common/engram.py` | wires disk-backed lookup into V4.1 Engram |
+| `vllm/models/deepseek_v4_1/common/engram_disk.py` | node-local bounded row staging |
+| `vllm/model_executor/model_loader/weight_utils.py` | skips full Engram tensor materialization and reclaims consumed safetensors page cache |
 
-Do **not** place `vllm-exl3` arena / mixed-K plugin code here. That belongs in a separate `vllm-exl3` PR.
+The mixed-K EXL3 implementation does **not** live in this overlay. It is in `vcruz305/vllm-exl3`, where @Blackwellboy's PR #10 is merged and pinned by `runtime.lock.json`.
 
-## Provenance
+## Supported application path
 
-- Adapted from the dedicated V4.1 image line (`vllm/vllm-openai:deepseekv41-flash-0909` / image-pinned Spark runtime).
-- New disk-backed storage path reuses vLLM Engram dequant semantics (fp8_e4m3fn + ue8m0 per-32 scales) from the pinned runtime; it is **not** a copy of TonoKen3 harness code.
-- `weight_utils.py` is Apache-2.0 vLLM code with a small Engram skip + fadvise addition for disk-backed mode.
-- License: Apache-2.0 (vLLM). See repo [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
-
-## Apply (qualification only)
-
-Mount or copy onto the container site-packages that match the **locked** V4.1 image ABI, for example:
+Do not manually overwrite site-packages for normal qualification. Build the reproducible derived image:
 
 ```bash
-SITE=/usr/local/lib/python3.12/dist-packages
-OV=overlays/disk-engram
-
-docker run ... \
-  -v "$PWD/$OV/vllm/config/engram.py:$SITE/vllm/config/engram.py:ro" \
-  -v "$PWD/$OV/vllm/models/deepseek_v4_1/common/engram.py:$SITE/vllm/models/deepseek_v4_1/common/engram.py:ro" \
-  -v "$PWD/$OV/vllm/models/deepseek_v4_1/common/engram_disk.py:$SITE/vllm/models/deepseek_v4_1/common/engram_disk.py:ro" \
-  -v "$PWD/$OV/vllm/model_executor/model_loader/weight_utils.py:$SITE/vllm/model_executor/model_loader/weight_utils.py:ro" \
-  -e VLLM_ENGRAM_DISK_BACKED=1 \
-  -e VLLM_ENGRAM_MODEL_DIR=/models \
-  ...
+bash scripts/build_runtime.sh
+bash scripts/build_disk_engram_runtime.sh
 ```
 
-Re-qualify after any base-image or vLLM pin advance. Overlay drift against a newer site-packages is a fail-closed event.
+This produces:
 
-## Enable
+```text
+deepseek-v41-exl3:disk-engram
+```
+
+`Dockerfile.disk-engram` applies only the explicit files above to the already locked Spark runtime and performs syntax/import assertions. It also corrects a typo in the PR #2 comparison-only eager loader branch before the image is accepted.
+
+Manual bind mounts are reserved for targeted debugging because they bypass those build assertions.
+
+## Qualification
+
+Start each Spark with:
 
 ```bash
-export VLLM_ENGRAM_DISK_BACKED=1
-# and/or
-# --engram-config {"cpu_offload":false,"disk_backed":true}
+bash scripts/start_disk_engram_cluster.sh head
+# or worker
+```
+
+Then use:
+
+```bash
+bash scripts/tp4_disk_engram_min_fit.sh --check
 bash scripts/tp4_disk_engram_min_fit.sh
 ```
+
+The launcher performs an all-node Ray preflight before model loading. See `docs/DISK_ENGRAM.md`.
+
+## License / provenance
+
+The copied/adapted vLLM files retain the upstream Apache-2.0 license and copyright notices. New recipe integration/orchestration remains under this repository's license. See `THIRD_PARTY_NOTICES.md` for attribution details.
