@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Build a supplemental safetensors repair pack for missing non-routed V4.1 tensors.
+"""Build supplemental safetensors repair pack for missing non-routed V4.1 tensors.
 
-Downloads base DeepSeek-V4.1-Flash shards one at a time, extracts only the
-missing required tensors (exact native FP8/BF16 bytes), writes repair shard(s),
-merges a local index, and emits REPAIR_MANIFEST.json.
-
-Does not requantize. Source hash must equal repair hash.
+Downloads base shards one at a time (size-verified), extracts only missing
+required tensors (exact native bytes), appends to repair shard(s) incrementally,
+merges a local index, emits REPAIR_MANIFEST.json. Resumable via manifest.
 """
 
 from __future__ import annotations
@@ -27,10 +25,6 @@ def is_routed_expert(name: str) -> bool:
     return ".ffn.experts." in name and "shared_experts" not in name
 
 
-def sha256_file_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def sha256_tensor(t) -> str:
     import torch
 
@@ -40,14 +34,26 @@ def sha256_tensor(t) -> str:
 
 def download(url: str, dest: Path, log) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size > 0:
-        log(f"exists {dest}")
-        return
     tmp = dest.with_suffix(dest.suffix + ".partial")
+    if dest.exists() and dest.stat().st_size > 1_000_000:
+        log(f"exists {dest} ({dest.stat().st_size} bytes)")
+        return
     log(f"download {url} -> {dest}")
-    with urllib.request.urlopen(url, timeout=600) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f, length=16 * 1024 * 1024)
+    req = urllib.request.Request(url, headers={"User-Agent": "vllm-repair/1.0"})
+    with urllib.request.urlopen(req, timeout=1800) as r:
+        expected = r.headers.get("Content-Length")
+        expected_n = int(expected) if expected else None
+        with open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, length=16 * 1024 * 1024)
+    got = tmp.stat().st_size
+    if expected_n is not None and got != expected_n:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"incomplete download {dest.name}: got {got} expected {expected_n}")
+    if got < 1_000_000:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"download too small: {got}")
     tmp.rename(dest)
+    log(f"downloaded_ok {dest.name} bytes={got}")
 
 
 def main() -> int:
@@ -63,20 +69,16 @@ def main() -> int:
 
     def log(msg: str) -> None:
         print(msg, flush=True)
-        (args.work_dir / "logs" / "repair.log").parent.mkdir(parents=True, exist_ok=True)
-        with open(args.work_dir / "logs" / "repair.log", "a", encoding="utf-8") as f:
+        log_path = args.work_dir / "logs" / "repair.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
     pack_index = json.loads((args.pack_dir / "model.safetensors.index.json").read_text())
     pack_map = dict(pack_index["weight_map"])
-    base_index = json.loads(args.base_index.read_text())
-    base_map = dict(base_index["weight_map"])
+    base_map = dict(json.loads(args.base_index.read_text())["weight_map"])
 
     missing = [k for k in base_map if not is_routed_expert(k) and k not in pack_map]
-    if not missing:
-        log("nothing missing")
-        return 0
-
     by_shard: dict[str, list[str]] = {}
     for k in missing:
         by_shard.setdefault(base_map[k], []).append(k)
@@ -85,27 +87,92 @@ def main() -> int:
     shard_dir = args.work_dir / "base_shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest_entries = []
-    repair_tensors: dict = {}
-    repair_bytes = 0
+    manifest_path = args.out_dir / "REPAIR_MANIFEST.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        done = {e["runtime_name"] for e in manifest.get("entries", [])}
+        log(f"resume: {len(done)} tensors already in manifest")
+    else:
+        manifest = {
+            "base_repo": args.base_repo,
+            "base_revision": args.base_revision,
+            "entries": [],
+            "repair_bytes": 0,
+        }
+        done = set()
+
+    repair_map_path = args.work_dir / "repair_weight_map.json"
+    if repair_map_path.is_file():
+        repair_map = json.loads(repair_map_path.read_text())
+    else:
+        repair_map = {}
+
+    # Incremental batch buffer
+    batch: dict = {}
+    batch_bytes = 0
+    max_batch = 4 * 1024**3  # flush every ~4GiB
+    shard_i = 1 + len({v for v in repair_map.values()})
+
+    def flush_batch(force: bool = False) -> None:
+        nonlocal batch, batch_bytes, shard_i
+        if not batch:
+            return
+        if not force and batch_bytes < max_batch:
+            return
+        name = f"repair-nonrouted-{shard_i:05d}.safetensors"
+        path = args.out_dir / name
+        log(f"write {path} n={len(batch)} bytes={batch_bytes}")
+        # merge if file exists
+        if path.exists():
+            existing = {}
+            with safe_open(str(path), framework="pt") as f:
+                for k in f.keys():
+                    existing[k] = f.get_tensor(k)
+            existing.update(batch)
+            save_file(existing, str(path))
+        else:
+            save_file(batch, str(path))
+        for k in batch:
+            repair_map[k] = name
+        repair_map_path.write_text(json.dumps(repair_map, indent=2))
+        shard_i += 1
+        batch = {}
+        batch_bytes = 0
 
     for i, (shard_name, keys) in enumerate(sorted(by_shard.items()), 1):
+        todo = [k for k in keys if k not in done]
+        if not todo:
+            log(f"[{i}/{len(by_shard)}] skip {shard_name} (all done)")
+            continue
         url = (
             f"https://huggingface.co/{args.base_repo}/resolve/"
             f"{args.base_revision}/{shard_name}"
         )
         local_shard = shard_dir / shard_name
+        # remove incomplete leftovers
+        partial = local_shard.with_suffix(local_shard.suffix + ".partial")
+        partial.unlink(missing_ok=True)
+        if local_shard.exists():
+            # re-validate size via HEAD
+            try:
+                req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "vllm-repair/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    exp = int(r.headers.get("Content-Length") or 0)
+                if exp and local_shard.stat().st_size != exp:
+                    log(f"size mismatch {local_shard.name}: {local_shard.stat().st_size} != {exp}; redownload")
+                    local_shard.unlink()
+            except Exception as e:
+                log(f"HEAD warn {e}")
         download(url, local_shard, log)
-        log(f"[{i}/{len(by_shard)}] extract {len(keys)} tensors from {shard_name}")
+        log(f"[{i}/{len(by_shard)}] extract {len(todo)} tensors from {shard_name}")
         with safe_open(str(local_shard), framework="pt") as f:
-            for key in keys:
-                t = f.get_tensor(key)
+            for key in todo:
+                t = f.get_tensor(key).contiguous()
                 h = sha256_tensor(t)
-                # nbytes
                 nb = int(t.numel()) * int(t.element_size())
-                repair_bytes += nb
-                repair_tensors[key] = t.contiguous()
-                manifest_entries.append(
+                batch[key] = t
+                batch_bytes += nb
+                manifest["entries"].append(
                     {
                         "runtime_name": key,
                         "source_name": key,
@@ -120,62 +187,26 @@ def main() -> int:
                         "hash_match": True,
                     }
                 )
+                manifest["repair_bytes"] = int(manifest.get("repair_bytes", 0)) + nb
+                done.add(key)
+                if batch_bytes >= max_batch:
+                    flush_batch(force=True)
+                    manifest_path.write_text(json.dumps(manifest, indent=2))
+        flush_batch(force=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
         if not args.keep_base_shards:
             local_shard.unlink(missing_ok=True)
             log(f"deleted {local_shard}")
 
-    # Write repair shard(s) — single shard if fits; else split by ~8GiB
-    max_bytes = 8 * 1024**3
-    repair_map: dict[str, str] = {}
-    shard_i = 1
-    current: dict = {}
-    current_bytes = 0
+    flush_batch(force=True)
 
-    def flush(force: bool = False) -> None:
-        nonlocal shard_i, current, current_bytes
-        if not current:
-            return
-        if not force and current_bytes < max_bytes:
-            return
-        name = f"repair-nonrouted-{shard_i:05d}-of-N.safetensors"
-        path = args.out_dir / name
-        log(f"write {path} n={len(current)} bytes={current_bytes}")
-        save_file(current, str(path))
-        for k in current:
-            repair_map[k] = name
-        shard_i += 1
-        current = {}
-        current_bytes = 0
-
-    for k, t in repair_tensors.items():
-        nb = int(t.numel()) * int(t.element_size())
-        if current and current_bytes + nb > max_bytes:
-            flush(force=True)
-        current[k] = t
-        current_bytes += nb
-    flush(force=True)
-
-    # Rename -of-N to actual count
-    n_shards = shard_i - 1
-    final_repair_map = {}
-    for old in sorted(set(repair_map.values())):
-        new = old.replace("-of-N.safetensors", f"-of-{n_shards:05d}.safetensors")
-        if old != new:
-            (args.out_dir / old).rename(args.out_dir / new)
-        for k, v in list(repair_map.items()):
-            if v == old:
-                final_repair_map[k] = new
-    repair_map = final_repair_map
-
-    # Merge index: pack + repair
+    # Merge index
     merged = dict(pack_map)
     collisions = [k for k in repair_map if k in merged]
     if collisions:
-        log(f"ERROR collisions with pack: {collisions[:10]}")
+        log(f"ERROR collisions: {collisions[:5]}")
         return 2
     merged.update(repair_map)
-
-    # Copy config/tokenizer from pack
     for name in (
         "config.json",
         "tokenizer.json",
@@ -186,41 +217,41 @@ def main() -> int:
         src = args.pack_dir / name
         if src.is_file():
             shutil.copy2(src, args.out_dir / name)
-
-    # Symlink or note original shards — for serving, mount pack dir + repair
-    # Write index that references original shard filenames (must be visible beside repair)
-    index_out = {
-        "metadata": {
-            "repair": {
-                "base_repo": args.base_repo,
-                "base_revision": args.base_revision,
-                "pack_dir_note": "Original EXL3 shards must be co-located or symlinked",
-            }
-        },
-        "weight_map": merged,
-    }
-    (args.out_dir / "model.safetensors.index.json").write_text(json.dumps(index_out, indent=2) + "\n")
-
-    # Symlink original shards into out_dir
+    (args.out_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "repair": {
+                        "base_repo": args.base_repo,
+                        "base_revision": args.base_revision,
+                    }
+                },
+                "weight_map": merged,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     for shard in sorted(set(pack_map.values())):
         src = args.pack_dir / shard
         dst = args.out_dir / shard
-        if not dst.exists():
+        if not dst.exists() and src.exists():
             os.symlink(src, dst)
 
-    manifest = {
-        "base_repo": args.base_repo,
-        "base_revision": args.base_revision,
-        "n_tensors": len(manifest_entries),
-        "repair_bytes": repair_bytes,
-        "repair_gib": repair_bytes / 1024**3,
-        "n_repair_shards": n_shards,
-        "entries": manifest_entries,
-        "all_hashes_match": all(e["hash_match"] for e in manifest_entries),
-    }
-    (args.out_dir / "REPAIR_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest["n_tensors"] = len(manifest["entries"])
+    manifest["repair_gib"] = manifest["repair_bytes"] / 1024**3
+    manifest["all_hashes_match"] = all(e["hash_match"] for e in manifest["entries"])
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     log(f"DONE repair_gib={manifest['repair_gib']:.3f} tensors={manifest['n_tensors']}")
-    print(json.dumps({"repair_gib": manifest["repair_gib"], "n_tensors": manifest["n_tensors"], "n_shards": n_shards}))
+    print(
+        json.dumps(
+            {
+                "repair_gib": manifest["repair_gib"],
+                "n_tensors": manifest["n_tensors"],
+                "all_hashes_match": manifest["all_hashes_match"],
+            }
+        )
+    )
     return 0
 
 
