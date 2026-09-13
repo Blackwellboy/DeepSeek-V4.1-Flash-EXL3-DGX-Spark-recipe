@@ -45,13 +45,30 @@ EAGER="${EAGER:-$LOCK_EAGER}"
 DRY_RUN="${DRY_RUN:-0}"
 NATIVE_MOE="${NATIVE_MOE:-$LOCK_NATIVE_MOE}"
 DISK_ENGRAM="${VLLM_ENGRAM_DISK_BACKED:-0}"
+MOE_PARALLEL_MODE="${MOE_PARALLEL_MODE:-ep}"
+MOE_PARALLEL_MODE="$(printf '%s' "$MOE_PARALLEL_MODE" | tr '[:upper:]' '[:lower:]')"
+if [[ "$MOE_PARALLEL_MODE" != "ep" && "$MOE_PARALLEL_MODE" != "tp" ]]; then
+  echo "ERROR: MOE_PARALLEL_MODE must be ep or tp (got '$MOE_PARALLEL_MODE')." >&2
+  exit 2
+fi
+if [[ "$MOE_PARALLEL_MODE" == "tp" && "$TP" == "4" ]] && ! is_true "${ALLOW_EXPERIMENTAL_TP4_MOE_TP:-0}"; then
+  cat >&2 <<'EOF'
+ERROR: pure MoE TP4 is not a default-qualified recipe path.
+Its 2304/4=576 local intermediate width is not 128-aligned; SGLang padded
+576->640 on GB300. This EXL3 recipe does not yet implement/qualify that padding.
+Use TP4+EP4, or set ALLOW_EXPERIMENTAL_TP4_MOE_TP=1 only for development.
+EOF
+  exit 2
+fi
 
-# Correctness-first default for both EP2 and EP4 is ExLlamaV3's fused/fallback
-# routed-expert path. Native p2b remains an explicit K2-K4 A/B.
+# Correctness-first default for EP2/EP4 is ExLlamaV3's fused/fallback routed
+# expert path. Pure MoE TP2 is an explicit A/B candidate: 2304/2=1152, already
+# 128-aligned, so it does not need the TP4-style 576->640 padding experiment.
 EXEC_ENV=(
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600
   -e VLLM_USE_RUST_FRONTEND=1
   -e VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  -e VLLM_EXL3_MOE_PARALLEL_MODE="$MOE_PARALLEL_MODE"
 )
 
 if is_true "$DISK_ENGRAM"; then
@@ -85,8 +102,6 @@ ARGS=(
   --quantization exl3
   --tokenizer-mode deepseek_v41
   --tensor-parallel-size "$TP"
-  --enable-expert-parallel
-  --enable-ep-weight-filter
   --distributed-executor-backend ray
   --tool-call-parser deepseek_v41
   --enable-auto-tool-choice
@@ -99,6 +114,13 @@ ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
 )
+
+if [[ "$MOE_PARALLEL_MODE" == "ep" ]]; then
+  ARGS+=( --enable-expert-parallel --enable-ep-weight-filter )
+  TOPOLOGY_LABEL="TP$TP + EP$TP"
+else
+  TOPOLOGY_LABEL="TP$TP + MoE-TP$TP (EP1)"
+fi
 
 if [[ -n "$MODEL_REVISION_RESOLVED" ]]; then
   ARGS+=( --revision "$MODEL_REVISION_RESOLVED" )
@@ -130,7 +152,8 @@ fi
 
 cat <<EOF
 === DeepSeek V4.1 EXL3 launch ===
-Topology:               TP$TP + EP$TP
+Topology:               $TOPOLOGY_LABEL
+MoE parallel mode:      $MOE_PARALLEL_MODE
 Ray GPUs:               $GPU_COUNT
 Model:                  $MODEL
 Model revision:         ${MODEL_REVISION_RESOLVED:-<local-or-unpinned-override>}
