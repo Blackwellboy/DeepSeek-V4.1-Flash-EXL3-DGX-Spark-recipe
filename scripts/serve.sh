@@ -44,6 +44,7 @@ DSPARK="${DSPARK:-$LOCK_DSPARK}"
 EAGER="${EAGER:-$LOCK_EAGER}"
 DRY_RUN="${DRY_RUN:-0}"
 NATIVE_MOE="${NATIVE_MOE:-$LOCK_NATIVE_MOE}"
+DISK_ENGRAM="${VLLM_ENGRAM_DISK_BACKED:-0}"
 
 # Correctness-first default for both EP2 and EP4 is ExLlamaV3's fused/fallback
 # routed-expert path. Native p2b remains an explicit K2-K4 A/B.
@@ -52,6 +53,18 @@ EXEC_ENV=(
   -e VLLM_USE_RUST_FRONTEND=1
   -e VLLM_USE_BREAKABLE_CUDAGRAPH=1
 )
+
+if is_true "$DISK_ENGRAM"; then
+  if [[ -z "${VLLM_ENGRAM_MODEL_DIR:-}" || "${VLLM_ENGRAM_MODEL_DIR}" != /* ]]; then
+    echo "ERROR: disk-backed Engram requires absolute VLLM_ENGRAM_MODEL_DIR inside the container." >&2
+    exit 2
+  fi
+  EXEC_ENV+=(
+    -e VLLM_ENGRAM_DISK_BACKED=1
+    -e VLLM_ENGRAM_MODEL_DIR="$VLLM_ENGRAM_MODEL_DIR"
+    -e VLLM_EXL3_MODEL_DIR="$VLLM_ENGRAM_MODEL_DIR"
+  )
+fi
 
 if is_true "$NATIVE_MOE"; then
   EXEC_ENV+=(
@@ -124,6 +137,8 @@ Model revision:         ${MODEL_REVISION_RESOLVED:-<local-or-unpinned-override>}
 Served name:            $SERVED_MODEL_NAME
 EXL3 backend variant:   $BACKEND_LABEL
 Native V4.1 MoE:        $NATIVE_MOE
+Disk-backed Engram:     $DISK_ENGRAM
+Engram model dir:       ${VLLM_ENGRAM_MODEL_DIR:-<resident-or-unset>}
 DSpark:                 $DSPARK
 Eager:                  $EAGER
 Text only:              $TEXT_ONLY
