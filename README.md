@@ -20,7 +20,7 @@ The recipe deliberately separates **loader-format compatibility** from **hardwar
 Current `vllm-exl3` pin:
 
 ```text
-5666d1b4a55ef2237797eaee60cbb042e933f375
+c69c8f8dda806ab19807a83506574fd391263cad
 ```
 
 That pin includes:
@@ -29,6 +29,7 @@ That pin includes:
 - per-MoE TP/EP geometry resolution;
 - **per-expert/per-projection mixed-K support from PR #10 by @Blackwellboy**;
 - exact K3–K8 trellis shapes for `w1`, `w2` and `w3`;
+- physical-trellis K selection for uniform fused layers, even when config/base K differs;
 - fused execution for uniform-K layers;
 - correctness-first `LinearEXL3` loop for heterogeneous layers;
 - a safety guard that disables low-memory prescan when expert placement is not linear.
@@ -125,7 +126,7 @@ The disk min-fit launcher additionally probes every Ray GPU node for:
 - mixed-K-capable `vllm-exl3`;
 - non-network backing storage.
 
-### 6. First TP4 load
+### 6. Arm the host UMA guards and run the first TP4 load
 
 Resident Engram is already recorded as:
 
@@ -133,15 +134,33 @@ Resident Engram is already recorded as:
 RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
 ```
 
-Do not reproduce it as the normal first gate. Use the disk path:
+Do not reproduce it as the normal first gate. Arm one exact-container watchdog on each Spark first:
 
 ```bash
-bash scripts/watch_oom_guard.sh
-bash scripts/tp4_disk_engram_min_fit.sh --check
-bash scripts/tp4_disk_engram_min_fit.sh
+OOM_GUARD_HOSTS="spark-a spark-b spark-c spark-d" \
+OOM_GUARD_CONTAINER_NAME=dsv41-exl3 \
+  bash scripts/watch_oom_guard.sh start
 ```
 
-The disk min-fit is locked to **8K / seq1 / text-only / eager / DSpark-off / native-off**.
+Verify them explicitly if desired:
+
+```bash
+OOM_GUARD_HOSTS="spark-a spark-b spark-c spark-d" \
+OOM_GUARD_CONTAINER_NAME=dsv41-exl3 \
+  bash scripts/check_oom_guards.sh 4
+```
+
+Then use the disk path:
+
+```bash
+bash scripts/tp4_disk_engram_min_fit.sh --check
+
+OOM_GUARD_HOSTS="spark-a spark-b spark-c spark-d" \
+OOM_GUARD_CONTAINER_NAME=dsv41-exl3 \
+  bash scripts/tp4_disk_engram_min_fit.sh
+```
+
+The disk min-fit is locked to **8K / seq1 / text-only / eager / DSpark-off / native-off** and refuses a real load unless all four guards are alive, unless the explicit debug bypass is set.
 
 The resident launcher remains available only for an intentional regression reproduction:
 
@@ -170,10 +189,11 @@ Do not mark TP4 deployment-ready until all of these are captured on real 4× Spa
 1. physical pack validation;
 2. runtime identity and NCCL collective pass;
 3. disk-Engram all-node preflight pass;
-4. full model load without the UMA cliff;
-5. `/v1/models` ready;
-6. deterministic smoke pass;
-7. per-node memory receipt proving full Engram stays non-resident.
+4. all four host UMA guards verified;
+5. full model load without the UMA cliff;
+6. `/v1/models` ready;
+7. deterministic smoke pass;
+8. per-node memory receipt proving full Engram stays non-resident.
 
 Only after that should larger context, DSpark and CUDA graphs be qualified independently.
 
@@ -188,6 +208,7 @@ TP2 no longer needs a layer-uniform repack merely to represent tensor-level mixe
 - `Dockerfile.disk-engram` — explicit TP4 disk-Engram derivative
 - `scripts/validate_pack.py` — physical checkpoint validator
 - `scripts/check_disk_engram_cluster.py` — all-node disk-Engram preflight
+- `scripts/check_oom_guards.sh` — exact-host watchdog verification
 - `scripts/tp4_disk_engram_min_fit.sh` — guarded TP4 first load
 - `scripts/oom_guard.sh` — exact-container UMA safety guard
 - `docs/TP4.md` — TP4 qualification details
