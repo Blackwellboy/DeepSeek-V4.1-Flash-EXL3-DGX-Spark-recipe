@@ -91,7 +91,6 @@ class MetadataAttestationTests(unittest.TestCase):
                 result["runtime_hf_overrides"]["quantization_config"]["mtp_experts"],
                 "source",
             )
-            # Attestation never mutates canonical model metadata.
             self.assertEqual(
                 json.loads((root / "config.json").read_text())["quantization_config"],
                 {"quant_method": "exl3"},
@@ -169,6 +168,21 @@ class MetadataAttestationTests(unittest.TestCase):
             )
             self.assertFalse(result["deployable_with_current_pinned_loader"])
 
+    def test_runtime_validator_preserves_self_describing_repack(self):
+        clean = {
+            "errors": [],
+            "warnings": [],
+            "deployable_with_current_pinned_loader": True,
+        }
+        with mock.patch.object(attested_pack, "validate_pack", return_value=clean):
+            result = attested_pack.validate_pack_for_runtime(
+                Path("/tmp/custom-repack"), "tp2", 0
+            )
+        self.assertTrue(result["deployable_with_current_pinned_loader"])
+        self.assertEqual(result["metadata_contract_source"], "checkpoint")
+        self.assertFalse(result["metadata_attestation_match"])
+        self.assertEqual(result["runtime_hf_overrides"], {})
+
     def test_checked_in_attestation_is_bound_to_runtime_lock(self):
         lock = json.loads((ROOT / "runtime.lock.json").read_text(encoding="utf-8"))
         contract = lock["models"]["tp2"]
@@ -203,6 +217,20 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn("--strict-locked-snapshot", text)
         self.assertIn("--print-hf-overrides", text)
         self.assertIn("HF_OVERRIDES_JSON", text)
+        self.assertIn('"$MODEL_RESOLVED" != "/models"', text)
+
+    def test_preflight_uses_effective_attested_metadata(self):
+        text = (SCRIPTS / "preflight.py").read_text(encoding="utf-8")
+        self.assertIn("from attested_pack import validate_pack_for_runtime", text)
+        self.assertIn("_effective_quantization", text)
+        self.assertIn("runtime_hf_overrides", text)
+        self.assertIn("quantization_metadata_source", text)
+
+    def test_remote_attestation_probe_is_range_only(self):
+        text = (SCRIPTS / "probe_tp2_attestation.py").read_text(encoding="utf-8")
+        self.assertIn("fetch_range", text)
+        self.assertNotIn("snapshot_download", text)
+        self.assertIn("REMOTE_METADATA_ATTESTATION", text)
 
 
 if __name__ == "__main__":
