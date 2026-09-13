@@ -30,3 +30,17 @@ RUNTIME_JIT_REQUIRED=NO
 ## Attribution
 
 See `THIRD_PARTY_NOTICES.md` and `overlays/sm12x-sparse-mla/PROVENANCE.md`.
+
+## Build image
+
+```bash
+docker build -f Dockerfile.fi07-sm12x -t deepseek-v41-exl3:fi07-sm12x .
+```
+
+## Launch hint
+
+```bash
+EXTRA_VLLM_ARGS='--block-size 128' \
+VLLM_DSV41_IMAGE=deepseek-v41-exl3:fi07-sm12x \
+  # mount overlays/sm12x-sparse-mla per mounts.txt, then serve_tp4
+```

@@ -1,0 +1,28 @@
+FROM deepseek-v41-exl3:spark
+ARG FI_SHA=07869c61ba581e6d6b8ad8d142f4a6c89b707cc1
+ARG CUTLASS_SHA=b46b16d003484063bca4ed365e44095c4c6ed633
+ARG CCCL_SHA=16bd510c9b712e82b0ab6cbb630d8e29ba1f7116
+ARG SPDLOG_SHA=c3aed4b68373955e1cc94307683d44dca1515d2b
+USER root
+RUN pip uninstall -y -q flashinfer-jit-cache flashinfer-cubin flashinfer-python || true
+RUN mkdir -p /opt/fi-src \
+ && curl -sL -m 900 "https://codeload.github.com/flashinfer-ai/flashinfer/tar.gz/${FI_SHA}" | tar xz -C /opt/fi-src --strip-components=1 \
+ && mkdir -p /opt/fi-src/3rdparty/cutlass /opt/fi-src/3rdparty/cccl /opt/fi-src/3rdparty/spdlog \
+ && curl -sL -m 900 "https://codeload.github.com/NVIDIA/cutlass/tar.gz/${CUTLASS_SHA}" | tar xz -C /opt/fi-src/3rdparty/cutlass --strip-components=1 \
+ && curl -sL -m 900 "https://codeload.github.com/NVIDIA/cccl/tar.gz/${CCCL_SHA}" | tar xz -C /opt/fi-src/3rdparty/cccl --strip-components=1 \
+ && curl -sL -m 900 "https://codeload.github.com/gabime/spdlog/tar.gz/${SPDLOG_SHA}" | tar xz -C /opt/fi-src/3rdparty/spdlog --strip-components=1 \
+ && test -f /opt/fi-src/3rdparty/cutlass/include/cutlass/cutlass.h \
+ && cd /opt/fi-src && BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 pip install --no-deps --no-build-isolation . \
+ && python3 -c "import flashinfer; print(\"FI\", flashinfer.__version__)" \
+ && rm -rf /opt/fi-src/build
+ENV VLLM_HAS_FLASHINFER_CUBIN=1
+ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
+ENV TORCH_CUDA_ARCH_LIST=12.1a
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+ENV MAX_JOBS=4
+ENV FLASHINFER_NVCC_THREADS=1
+# Python-level decode contract (no GPU needed)
+RUN python3 -c "import flashinfer; from flashinfer.mla import supported_sparse_mla_sm120_configs as f; c=f()[\"dsv4\"]; assert c.supports_decode(num_heads=16, topk=1152), c; print(\"DECODE_16x1152_OK\", flashinfer.__version__, \"topks\", sorted(c.topks)[:8], \"runtime\", c.topk_is_runtime)"
+# Prewarm sparse_mla_sm120 JIT for sm_121a
+RUN FLASHINFER_CUDA_ARCH_LIST=12.1a MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 timeout 3600 python3 -c "from flashinfer.mla._sparse_mla_sm120 import get_sparse_mla_sm120_module; get_sparse_mla_sm120_module(); print(\"SPARSE_MLA_PREWARM_OK\")" \
+ || echo "PREWARM_DEFERRED"
