@@ -1,255 +1,202 @@
 # Troubleshooting
 
-## Start here: run the doctor
-
-Before changing runtime knobs:
+## Start with the gates, not runtime knobs
 
 ```bash
 bash scripts/doctor.sh 4
-# or
-bash scripts/doctor.sh 2
+python3 scripts/probe_remote_pack.py --tp 4
+bash scripts/preflight.sh 4
 ```
 
-The recipe now treats runtime identity, disk/cache placement and physical checkpoint layout as first-class gates. Do not debug a vLLM load until those pass.
+Do not debug a vLLM model load until runtime identity, checkpoint structure and distributed transport pass.
 
-## `runtime.lock.json` and my local settings disagree
+## Shell overrides look wrong
 
-`runtime.lock.json` is authoritative for the supported recipe path. `build_runtime.sh` fails closed when a component override differs from the lock.
-
-For an intentional experiment only:
-
-```bash
-ALLOW_RUNTIME_OVERRIDE=1 \
-VLLM_EXL3_REF=<sha> \
-bash scripts/build_runtime.sh
-```
-
-Record the resulting runtime identity before comparing results.
-
-## My shell overrides were ignored
-
-Current precedence is:
+Normal recipe precedence is:
 
 ```text
-explicit shell environment > .env > runtime.lock.json defaults
+explicit shell environment > .env > runtime-lock defaults
 ```
 
-Prove the exact launch without loading weights:
-
-```bash
-DRY_RUN=1 MAX_MODEL_LEN=8192 MAX_NUM_SEQS=1 bash scripts/serve_tp4.sh
-```
-
-Do not count a run as an 8K/seq1 test unless the printed command actually says 8192 and seq1.
-
-## The TP4/TP2 remote model is blocked before serving
-
-Expected when the locked artifact status is not `deployable`.
-
-Current source/qualification artifacts may be complete on Hugging Face while still violating the vLLM routed-loader contract. The recipe therefore refuses direct remote launch by default.
-
-Materialize the artifact deliberately, then validate it:
-
-```bash
-ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
-  bash scripts/materialize_model.sh 4 /large/models/tp4
-
-python3 scripts/validate_pack.py /large/models/tp4 --topology tp4 --reserve-gib 32
-```
-
-For TP2 use topology `tp2`.
-
-Never use `TP4_ALLOW_UNVALIDATED=1` or `TP2_ALLOW_UNVALIDATED=1` for benchmark or production claims. Those are loader-development bypasses only.
-
-## `validate_pack.py` reports pointer/HTML/truncated shards
-
-The local bytes are not a complete safetensors snapshot.
-
-- `pointer`: Git LFS/Xet object was not materialized.
-- `html`: an error/login/proxy page was saved as a model file.
-- `truncated`: file/header ended before the declared safetensors structure.
-
-Use `scripts/materialize_model.sh` on a sufficiently large filesystem. Do not requantize until you know the HF objects themselves are genuinely bad.
-
-## `validate_pack.py` reports index/header disagreement
-
-The validator now fails when:
-
-- an index tensor is missing from its declared shard;
-- a shard contains a tensor absent from the index;
-- a tensor's `data_offsets` exceed the file payload;
-- known dtype/shape byte counts disagree with the declared byte range.
-
-Treat those as artifact integrity/repack problems, not loader problems.
-
-## `validate_pack.py` reports multiple physical K widths in one routed layer
-
-This is a **pack/runtime-format mismatch**.
-
-Current `vllm-exl3` accepts K2-K8, but each vLLM `RoutedExperts` transformer layer still allocates one K width. Tensor-granular SAGE packs can therefore be valid EXL3 artifacts yet incompatible with this serving layout.
-
-The short-term fix is a layer-uniform compatibility repack that preserves mixed K across transformer layers while coalescing K inside each routed layer. Changing K requires real re-encoding; metadata edits are not sufficient.
-
-Do not solve this by enabling diagnostic shape-mismatch loading for normal inference.
-
-## Shape mismatch hard failure
-
-Default behavior remains a hard failure. This is intentional.
-
-The merged plugin supports:
+The disk-Engram wrapper adds its profile between caller values and `.env`:
 
 ```text
-VLLM_EXL3_ALLOW_SHAPE_MISMATCH=1
+explicit caller > disk profile > .env > lock/defaults
 ```
 
-only as an explicit diagnostic mode. It zero-fills the destination and coordinate-copies the per-dimension overlap while preserving rank checks. Output is knowingly invalid and must not be benchmarked or presented as model inference.
+Use `--check`/`DRY_RUN=1` and inspect the printed launch before counting a run as valid.
 
-## TP4 resident model drives a Spark to near-full system memory
+## Pointer / HTML / truncated safetensors
 
-First ensure the physical pack validation passed. Then run the narrow min-fit gate:
+Those are artifact-materialization failures, not EXL3 kernel failures. Materialize the immutable HF revision with `scripts/materialize_model.sh` on a large filesystem and rerun `validate_pack.py`.
 
-```bash
-# terminal 1
-bash scripts/watch_cluster_memory.sh
+The validator also rejects index/header disagreement, invalid `data_offsets` and dtype/shape byte-count mismatches.
 
-# terminal 2
-bash scripts/tp4_min_fit.sh --check
-bash scripts/tp4_min_fit.sh
-```
+## Multiple physical K widths in one routed layer
 
-If the verified 8K/seq1/text-only/eager/no-DSpark/no-native run still reaches the same near-full unified-memory cliff during Engram loading and a worker becomes unresponsive, record:
+This is **supported by the current pinned plugin**.
+
+`vllm-exl3` stores exact per-expert/per-projection trellis shapes. K3–K8 may differ between experts and `w1`, `w2`, `w3` may differ inside one expert.
+
+Expected behavior:
 
 ```text
-RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
+uniform-K layer       -> fused path when available
+heterogeneous-K layer -> LinearEXL3 python loop
 ```
 
-Then stop changing context/batch/memory-utilization knobs and move to a separately identified nonresident/disk-backed Engram variant.
+The heterogeneous path is correctness-first and **not CUDA-graph-qualified**. Keep first boot eager.
 
-## Docker image IDs differ between Sparks after loading the same archive
+If `validate_pack.py` reports an unsupported K, malformed tensor geometry or physical corruption, that is still a hard failure.
 
-Do not immediately assume the image payloads differ. Moby issue [#51934](https://github.com/moby/moby/issues/51934) documents `docker load` producing different image IDs across machines/storage integrations while RootFS layers can remain identical.
+## Old `64 vs 48` trellis shape error
 
-Capture:
+That was the layer-uniform allocation bug fixed by the per-expert mixed-K loader. The current loader should allocate the physical trellis width rather than pad/trim it.
 
-```bash
-bash scripts/image_fingerprint.sh /path/to/saved-image.tar
-```
-
-Compare:
-
-1. archive SHA256;
-2. complete `RootFS.Layers` list;
-3. locked plugin/ExLlama revisions;
-4. `runtime_identity.sh` output;
-5. Docker storage driver/image-store mode.
-
-A different short `docker images` ID alone is not sufficient evidence of different runtime contents.
-
-## `DeepseekV41ForCausalLM` is unknown
-
-Use the dedicated image from the runtime lock:
-
-```text
-vllm/vllm-openai:deepseekv41-flash-0909
-```
-
-Do not fix this with a stock `pip install -U vllm`; that can remove the V4.1 architecture/runtime this recipe depends on.
-
-## `--quantization exl3` is unknown
-
-Run:
+If the same failure reappears, capture:
 
 ```bash
 bash scripts/runtime_identity.sh
 ```
 
-The image must contain `/opt/vllm-exl3` at the locked commit and `vllm_exl3.runtime_diagnostics()` must succeed after registration.
+and confirm the plugin pin is the one in `runtime.lock.json`.
 
-## Native ABI is stale
+Do **not** revive the old partial-copy diagnostic as a production fix. Exact-shape trellis loading supersedes it.
 
-The container has an old `vllm_exl3_c` extension. Rebuild the locked runtime; do not copy new Python plugin files over an old `.so`.
+## TP4 resident Engram hits the UMA cliff
 
-Expected:
+This is a known result:
 
 ```text
-P2B_MOE_ABI_VERSION >= 3
+RESIDENT_ENGRAM_TP4=CAPACITY_FAIL
 ```
 
-## Ray sees fewer GPUs/nodes than expected
+Do not keep sweeping memory-utilization/context/batch settings to reproduce it. Use the guarded disk path:
 
-On the head:
+```bash
+bash scripts/build_disk_engram_runtime.sh
+bash scripts/tp4_disk_engram_min_fit.sh --check
+bash scripts/tp4_disk_engram_min_fit.sh
+```
+
+The resident launcher is regression-only:
+
+```bash
+ALLOW_RESIDENT_ENGRAM_RETEST=1 bash scripts/tp4_min_fit.sh
+```
+
+## Disk-Engram preflight fails on one node
+
+The disk launcher checks every Ray GPU node. Common causes:
+
+- the node was started with the baseline image instead of `deepseek-v41-exl3:disk-engram`;
+- `VLLM_ENGRAM_DISK_BACKED=1` was not present when the Ray container started;
+- `VLLM_ENGRAM_MODEL_DIR` differs across nodes;
+- the local model/index is absent;
+- backing storage is NFS/CIFS/another network filesystem;
+- the node has a stale `vllm-exl3` revision.
+
+Start every node through `scripts/start_disk_engram_cluster.sh` with the same in-container model path.
+
+## Disk mode still starts materializing full Engram
+
+Stop the run. The disk path is supposed to skip the large `engram.embed.weight/scale` tensors.
+
+Verify the derived image and all-node preflight instead of manually mounting overlay files. The supported path is:
+
+```bash
+bash scripts/build_runtime.sh
+bash scripts/build_disk_engram_runtime.sh
+```
+
+Then restart the Ray containers through the dedicated disk wrapper.
+
+## OOM guard could stop the wrong workload
+
+Current guard behavior is exact-name only. Set:
+
+```text
+OOM_GUARD_CONTAINER_NAME=<exact recipe container>
+```
+
+It no longer pattern-matches arbitrary DeepSeek containers. MemAvailable crossing the hard threshold is the stop condition; swap growth alone is evidence/warning.
+
+## Ray sees fewer GPUs than expected
 
 ```bash
 bash scripts/cluster_status.sh
 ```
 
-Each DGX Spark contributes one GPU. Verify `HEAD_IP`, `NODE_IP`, host networking and that every worker joined the same Ray port.
-
-## The launcher says the cluster container already exists
-
-This is now fail-closed by design. `start_cluster.sh` no longer destroys an existing container implicitly.
-
-If replacement is intentional:
+Each Spark contributes one GPU. Verify `HEAD_IP`, per-node `NODE_IP`, host networking and Ray port. Then require the real collective:
 
 ```bash
-REPLACE_CONTAINER=1 HEAD_IP=... NODE_IP=... bash scripts/start_cluster.sh head
+bash scripts/cluster_collective.sh 4
 ```
 
-## RDMA / RoCE startup problems
-
-Modes:
+## RDMA / RoCE issues
 
 ```text
-ENABLE_RDMA=auto   # default; use RDMA device only when present
-ENABLE_RDMA=1      # require RDMA device; missing device is a hard error
-ENABLE_RDMA=0      # no RDMA mapping or IB/RoCE overrides
+ENABLE_RDMA=auto   # default
+ENABLE_RDMA=1      # require RDMA
+ENABLE_RDMA=0      # disable RDMA mapping/IB overrides
 ```
 
-In `auto`, Spark-specific HCA/interface defaults are only applied when those host interfaces exist. Explicit environment overrides still win.
+If cluster behavior is unclear, use `ENABLE_RDMA=0` first to separate generic Ray/NCCL issues from RoCE tuning.
 
-If transport is unstable, first run with `ENABLE_RDMA=0` to separate generic cluster issues from RoCE tuning. Do not change networking and model/kernel settings at the same time.
+## Existing cluster container blocks startup
 
-## Worker cannot find the local model
-
-Every node must mount the same host-side `MODEL_DIR` at `/models`, and `MODEL` must point inside it, for example:
+That is intentional. The recipe does not delete a running container silently.
 
 ```bash
-MODEL_DIR=/data/models
-MODEL=/models/DeepSeek-V4.1-Flash-EXL3
+REPLACE_CONTAINER=1 ... bash scripts/start_cluster.sh head
 ```
 
-Use the validator's per-shard header hashes and the locked model revision as lightweight cross-node identity evidence.
+Only use replacement when intentional.
 
-## TP4 shows a 576 intermediate width
+## Worker cannot see the local model
 
-You are not actually using expert parallelism. Intended TP4+EP4 keeps whole 5120 × 2304 experts and assigns 96 experts per rank.
+Every node must mount the same host-side model root at `/models`, and the in-container `MODEL` / `VLLM_ENGRAM_MODEL_DIR` must identify the same snapshot path.
 
-The normal launcher includes `--enable-expert-parallel`.
+For disk Engram the all-node preflight verifies this before load.
+
+## TP4 shows intermediate width 576
+
+You are not using the intended expert-parallel geometry. TP4+EP4 keeps whole **5120 × 2304** experts and assigns **96 experts/rank**.
 
 ## TP2 owns 192 local experts
 
-That is expected and is **not** an ExLlamaV3 total-expert-count failure. The correctness-first backend for TP2 remains ExLlamaV3 (`NATIVE_MOE=0`). The custom native p2b path is a separate K2-K4 experiment.
+Expected. It is not an ExLlamaV3 total-expert ceiling. TP2 is now primarily a **capacity/nonresident-Engram qualification problem**, not a mixed-K representation problem.
 
-## DSpark hangs or graph capture becomes unstable
+## CUDA graphs or DSpark fail after eager base works
 
 Return to:
 
 ```bash
-DSPARK=0 EAGER=1
+DSPARK=0 EAGER=1 NATIVE_MOE=0
 ```
 
-Then add DSpark in eager mode only after the non-speculative baseline is correct.
+Heterogeneous mixed-K graph mode is not yet qualified. DSpark and graphs are separate qualification steps after base correctness.
 
-## Native path produces bad output
+## Native MoE produces wrong output
 
-Return immediately to:
+Return to the ExLlamaV3/mixed-K correctness path:
 
 ```bash
 NATIVE_MOE=0 DSPARK=0 EAGER=1
 ```
 
-Capture checkpoint revision, prompt, runtime diagnostics and failing output. Do not interpret speed until output parity is established.
+Native p2b remains a separate K2–K4 experiment.
 
-## Smoke test prints a failure despite a 200 response
+## Smoke test gets HTTP 200 but fails
 
-That is intentional. `smoke_test.sh` now verifies both `/v1/models` and exact deterministic response content. A fluent but incorrect model is not considered a pass.
+Expected when output is wrong. `smoke_test.sh` verifies `/v1/models` and exact deterministic response content:
+
+```text
+EXL3 Spark OK
+```
+
+A fluent but incorrect response is not a pass.
+
+## Docker image IDs differ after loading the same archive
+
+Do not use a short image ID as the identity proof. Compare archive SHA256, complete RootFS layer list, locked source revisions and `runtime_identity.sh` receipts.
