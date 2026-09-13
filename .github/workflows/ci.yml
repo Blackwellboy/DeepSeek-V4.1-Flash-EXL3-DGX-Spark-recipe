@@ -30,6 +30,9 @@ jobs:
         run: |
           python -m json.tool configs/quantization_config.example.json >/dev/null
           python -m json.tool runtime.lock.json >/dev/null
+          for f in attestations/*.json; do
+            python -m json.tool "$f" >/dev/null
+          done
 
       - name: Runtime and deployment contract tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v

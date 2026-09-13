@@ -102,9 +102,14 @@ fi
 
 echo
 echo "Validating physical checkpoint contract and locked snapshot identity..."
-python3 "$RECIPE_ROOT/scripts/validate_pack.py" \
-  "$DEST" --topology "$TOPOLOGY" --reserve-gib "$POST_RESERVE_GIB" \
-  --strict-locked-snapshot
+if [[ "$TP" == "2" ]]; then
+  python3 "$RECIPE_ROOT/scripts/check_tp2_pack.py" \
+    "$DEST" --reserve-gib "$POST_RESERVE_GIB" --strict-locked-snapshot
+else
+  python3 "$RECIPE_ROOT/scripts/validate_pack.py" \
+    "$DEST" --topology "$TOPOLOGY" --reserve-gib "$POST_RESERVE_GIB" \
+    --strict-locked-snapshot
+fi
 
 echo
 echo "Materialized and validated: $DEST"
