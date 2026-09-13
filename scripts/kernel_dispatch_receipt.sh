@@ -13,7 +13,7 @@ fi
 cat <<'EOF'
 === vllm-exl3 runtime diagnostics ===
 EOF
-docker exec "$CONTAINER_NAME" python - <<'PY'
+docker exec -i "$CONTAINER_NAME" python - <<'PY'
 import json
 import vllm_exl3
 vllm_exl3.register()
