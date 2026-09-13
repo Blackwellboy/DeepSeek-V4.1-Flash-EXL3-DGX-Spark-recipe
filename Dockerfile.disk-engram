@@ -1,0 +1,78 @@
+ARG BASE_RUNTIME=deepseek-v41-exl3:spark
+FROM ${BASE_RUNTIME}
+
+USER root
+COPY overlays/disk-engram /opt/dsv41-disk-engram-overlay
+
+# Apply only the explicitly listed vLLM overlay files to the already locked
+# Spark runtime. Resolve the installed package root dynamically instead of
+# hard-coding a Python minor-version path.
+RUN python - <<'PY'
+from pathlib import Path
+import shutil
+import vllm
+
+src = Path('/opt/dsv41-disk-engram-overlay/vllm')
+dst = Path(vllm.__file__).resolve().parent
+files = [
+    Path('config/engram.py'),
+    Path('models/deepseek_v4_1/common/engram.py'),
+    Path('models/deepseek_v4_1/common/engram_disk.py'),
+    Path('model_executor/model_loader/weight_utils.py'),
+]
+for rel in files:
+    source = src / rel
+    target = dst / rel
+    if rel.name != 'engram_disk.py' and not target.is_file():
+        raise SystemExit(f'ERROR: pinned base runtime is missing expected vLLM file: {target}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    print('overlay:', rel, '->', target)
+
+# PR #2 carried one typo in a non-default eager-loader comparison branch.
+# Correct it in the derived image and assert no stale spelling remains.
+weight_utils = dst / 'model_executor/model_loader/weight_utils.py'
+text = weight_utils.read_text(encoding='utf-8')
+text = text.replace('_adviseadvise_dontneed_path', '_fadvise_dontneed_path')
+weight_utils.write_text(text, encoding='utf-8')
+if '_adviseadvise_dontneed_path' in text:
+    raise SystemExit('ERROR: stale fadvise typo remains in disk-Engram overlay')
+PY
+
+RUN python -m py_compile \
+      $(python - <<'PY'
+from pathlib import Path
+import vllm
+root = Path(vllm.__file__).resolve().parent
+for rel in (
+    'config/engram.py',
+    'models/deepseek_v4_1/common/engram.py',
+    'models/deepseek_v4_1/common/engram_disk.py',
+    'model_executor/model_loader/weight_utils.py',
+):
+    print(root / rel)
+PY
+      )
+
+RUN python - <<'PY'
+import vllm
+import vllm_exl3
+from vllm.config.engram import EngramConfig
+from vllm.models.deepseek_v4_1.common.engram_disk import (
+    engram_disk_backed_enabled,
+    should_skip_engram_embed_tensor,
+)
+
+vllm_exl3.register()
+diag = vllm_exl3.runtime_diagnostics()
+assert hasattr(EngramConfig, 'disk_backed'), 'EngramConfig.disk_backed missing'
+assert should_skip_engram_embed_tensor('layers.1.engram.embed.weight') is False
+assert diag['mixed_k']['tensor_level_mixed_k_within_layer'] is True, diag['mixed_k']
+assert diag['mixed_k']['cudagraph_qualified'] is False, diag['mixed_k']
+print('disk Engram overlay import: OK')
+print('vLLM:', vllm.__version__)
+print('vllm-exl3 mixed-K:', diag['mixed_k'])
+PY
+
+ENV VLLM_ENGRAM_DISK_BACKED=1
+WORKDIR /workspace
