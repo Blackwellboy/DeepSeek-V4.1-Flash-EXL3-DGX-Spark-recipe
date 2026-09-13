@@ -29,7 +29,7 @@ The exact upstream source commit represented by the dedicated image tag has not 
 ## vllm-exl3
 
 - Project: https://github.com/vcruz305/vllm-exl3
-- Pinned revision: `c69c8f8dda806ab19807a83506574fd391263cad`
+- Pinned revision: `814d4fe38082cddd838b45418c7d13a95395a36a`
 - License: AGPL-3.0-only plus historical/third-party notices in that repository.
 
 ### PR #9 — @fattchris
@@ -58,7 +58,9 @@ Mainline hardening after that contribution:
 
 - marks heterogeneous mixed-K eager-first/not CUDA-graph-qualified;
 - disables arena prescan for non-linear/EPLB expert placement;
-- derives fused uniform-layer K from the **loaded physical trellis geometry**, so a physically uniform K5/K7 layer cannot be launched using a stale config/base K.
+- derives fused uniform-layer K from the **loaded physical trellis geometry**, so a physically uniform K5/K7 layer cannot be launched using a stale config/base K;
+- makes mixed-K header prescan mirror local TP sharding so pure-MoE-TP2 can preallocate correct 1152-wide local trellis geometry;
+- adds V4.1-specific cache/topology planning without replacing the older V4 MLA helper.
 
 Those follow-up maintainer changes do not rewrite or squash @Blackwellboy's original merged commit; it remains in `main` ancestry.
 
@@ -105,6 +107,13 @@ The experimental overlay contains:
 - `overlays/disk-engram/vllm/model_executor/model_loader/weight_utils.py`
 
 Copied/adapted vLLM files retain Apache-2.0 headers. The new disk helper uses the same license/provenance boundary documented in its source header.
+
+## SGLang V4.1 optimization article (research reference)
+
+- Reference: https://www.sglang.io/blog/deepseek-v4.1-flash-kernel-optimization?v=4
+- Role: architecture/performance reference only; no SGLang kernel source is copied into this repository.
+- Adopted as independently implemented hypotheses/tools: V4.1 logical cache accounting, kernel-dispatch receipts, and an EP2-vs-pure-MoE-TP2 A/B because 1152 is already 128-aligned.
+- GB300 performance results are not treated as expected DGX Spark throughput.
 
 ## NVIDIA / CUDA / DGX Spark
 
