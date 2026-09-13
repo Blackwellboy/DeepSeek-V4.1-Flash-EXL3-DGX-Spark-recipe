@@ -11,8 +11,8 @@ import subprocess
 import sys
 from typing import Any
 
+from attested_pack import validate_pack_for_runtime
 from runtime_lock import load_lock
-from validate_pack import validate_pack
 
 
 def git_head(path: str) -> str | None:
@@ -41,6 +41,34 @@ def load_model_config(model: str, revision: str | None) -> tuple[dict[str, Any],
         token=os.environ.get("HF_TOKEN") or None,
     )
     return json.loads(Path(config_path).read_text(encoding="utf-8")), config_path
+
+
+def _effective_quantization(
+    raw_quant: dict[str, Any],
+    physical_pack: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str]:
+    """Return the effective runtime quant config and its provenance.
+
+    A runtime-only override is accepted here only if the physical-pack validator
+    already proved the immutable TP2 metadata attestation. Generic/local packs
+    remain self-describing and use their checkpoint metadata directly.
+    """
+    effective = dict(raw_quant)
+    source = "checkpoint"
+    if not isinstance(physical_pack, dict):
+        return effective, source
+    if physical_pack.get("metadata_contract_source") != "locked_snapshot_attestation":
+        return effective, source
+    if physical_pack.get("metadata_attestation_match") is not True:
+        return effective, source
+    overrides = physical_pack.get("runtime_hf_overrides")
+    if not isinstance(overrides, dict):
+        return effective, source
+    override_quant = overrides.get("quantization_config")
+    if not isinstance(override_quant, dict):
+        return effective, source
+    effective.update(override_quant)
+    return effective, "locked_snapshot_attestation"
 
 
 def main() -> int:
@@ -79,13 +107,34 @@ def main() -> int:
         )
 
     config, config_source = load_model_config(args.model, args.revision or None)
-    quant = config.get("quantization_config")
-    if not isinstance(quant, dict):
-        quant = {}
+    raw_quant = config.get("quantization_config")
+    if not isinstance(raw_quant, dict):
+        raw_quant = {}
         issues.append("config.json has no quantization_config object")
-    if str(quant.get("quant_method", "")).lower() != "exl3":
+    if str(raw_quant.get("quant_method", "")).lower() != "exl3":
         issues.append("quantization_config.quant_method must be 'exl3'")
 
+    model_path = Path(args.model).expanduser()
+    physical_pack: dict[str, Any] | None = None
+    if model_path.is_dir():
+        physical_pack = validate_pack_for_runtime(
+            model_path, topology, args.pack_reserve_gib
+        )
+        if not physical_pack["deployable_with_current_pinned_loader"]:
+            issues.extend(f"pack: {item}" for item in physical_pack["errors"])
+            issues.extend(
+                f"pack attestation: {item}"
+                for item in physical_pack.get("metadata_attestation_mismatches", [])
+            )
+        warnings.extend(f"pack: {item}" for item in physical_pack["warnings"])
+    else:
+        warnings.append(
+            "remote model id: physical shard/K/index validation was not run; materialize locally before claiming deployment readiness"
+        )
+
+    quant, quantization_metadata_source = _effective_quantization(
+        raw_quant, physical_pack
+    )
     source = quant.get("non_routed_quantization")
     if not isinstance(source, dict):
         source = {}
@@ -97,7 +146,7 @@ def main() -> int:
     if quant.get("mtp_experts") != "source":
         issues.append("mtp_experts must be 'source' for the baseline DSpark policy")
 
-    codebook = str(quant.get("codebook", "mcg")).lower()
+    codebook = str(quant.get("codebook", raw_quant.get("codebook", "mcg"))).lower()
     if codebook != "mcg":
         warnings.append(f"codebook={codebook!r}; custom native p2b remains MCG-only")
 
@@ -109,18 +158,6 @@ def main() -> int:
     ):
         warnings.append(
             f"model identity does not look like DeepSeek V4.1: model_type={model_type!r}, architectures={architectures!r}"
-        )
-
-    model_path = Path(args.model).expanduser()
-    physical_pack: dict[str, Any] | None = None
-    if model_path.is_dir():
-        physical_pack = validate_pack(model_path, topology, args.pack_reserve_gib)
-        if not physical_pack["deployable_with_current_pinned_loader"]:
-            issues.extend(f"pack: {item}" for item in physical_pack["errors"])
-        warnings.extend(f"pack: {item}" for item in physical_pack["warnings"])
-    else:
-        warnings.append(
-            "remote model id: physical shard/K/index validation was not run; materialize locally before claiming deployment readiness"
         )
 
     abi = int(getattr(vllm_exl3_c, "P2B_MOE_ABI_VERSION", 0))
@@ -235,14 +272,20 @@ def main() -> int:
         "model_type": model_type,
         "architectures": architectures,
         "physical_pack": physical_pack,
+        "quantization_metadata_source": quantization_metadata_source,
+        "raw_quantization": raw_quant,
         "quantization": {
             "quant_method": quant.get("quant_method"),
-            "bits": quant.get("bits"),
-            "codebook": quant.get("codebook"),
-            "scope": quant.get("scope"),
-            "layer_bits_present": isinstance(quant.get("layer_bits"), dict),
+            "bits": quant.get("bits", raw_quant.get("bits")),
+            "codebook": quant.get("codebook", raw_quant.get("codebook")),
+            "scope": quant.get("scope", raw_quant.get("scope")),
+            "layer_bits_present": isinstance(
+                quant.get("layer_bits", raw_quant.get("layer_bits")), dict
+            ),
             "mtp_experts": quant.get("mtp_experts"),
-            "mtp_experts_start_layer": quant.get("mtp_experts_start_layer"),
+            "mtp_experts_start_layer": quant.get(
+                "mtp_experts_start_layer", raw_quant.get("mtp_experts_start_layer")
+            ),
             "source_quant_method": source.get("quant_method"),
             "source_weight_block_size": source.get("weight_block_size"),
         },
