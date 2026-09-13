@@ -1,6 +1,6 @@
 {
   "schema": "dsv41-exl3-runtime-lock.v1",
-  "generated_at": "2026-09-13T05:50:00Z",
+  "generated_at": "2026-09-13T07:05:00Z",
   "base_image": {
     "ref": "vllm/vllm-openai:deepseekv41-flash-0909",
     "digest": null,
@@ -53,7 +53,8 @@
       "revision": "e831e9e4d6bfeafa6d630848296417b1393404a3",
       "expected_shards": 31,
       "status": "mixed_k_loader_ready_pending_tp2_capacity_qualification",
-      "required_loader_contract": "per_expert_mixed_k_routed_trellis"
+      "required_loader_contract": "per_expert_mixed_k_routed_trellis",
+      "runtime_metadata_attestation": "attestations/tp2-e831e9e4-metadata.json"
     }
   },
   "first_boot": {
