@@ -84,8 +84,10 @@ write_receipt() {
     echo "--- /proc/meminfo subset ---"
     grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Active\(file\)|Inactive\(file\)|Dirty|Writeback|AnonPages|Mapped|Shmem):' /proc/meminfo
   } >"$receipt"
-  echo "$(ts) RECEIPT=$receipt"
-  echo "$receipt"
+  # Log the human-readable line on stderr so command substitution captures only
+  # the pathname. This keeps OOM_GUARD_TRIGGER_RECEIPT a valid one-line env value.
+  echo "$(ts) RECEIPT=$receipt" >&2
+  printf '%s\n' "$receipt"
 }
 
 if [[ -f "$PID_FILE" ]]; then
