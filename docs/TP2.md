@@ -9,7 +9,9 @@ TP2 is the aggressive DeepSeek-V4.1-Flash EXL3 target.
 
 The pinned `vllm-exl3` can represent **exact per-expert/per-projection K2–K8 trellis shapes**. TP2 no longer needs a layer-uniform repack merely because the SAGE artifact contains tensor-level mixed K.
 
-The remaining blocker is **two-Spark capacity and runtime qualification**, not mixed-K representation.
+The canonical snapshot's `config.json` predates the explicit mixed-format delegation metadata required by the current runtime. Do **not** edit the model config. The recipe binds the required runtime-only metadata to the exact locked snapshot through [`TP2_METADATA_ATTESTATION.md`](TP2_METADATA_ATTESTATION.md).
+
+The remaining hardware blocker is **two-Spark capacity and runtime qualification**, not mixed-K representation.
 
 ## Two MoE topology candidates
 
@@ -38,14 +40,27 @@ MOE_PARALLEL_MODE=tp  # experimental pure MoE TP2
 
 Pure MoE TP4 remains blocked by default because this recipe has not implemented/qualified 576->640 EXL3 padding.
 
-## Gate 0: host and remote metadata
+## Gate 0: host and immutable remote metadata
+
+Run the host doctor as usual:
 
 ```bash
 bash scripts/doctor.sh 2
-python3 scripts/probe_remote_pack.py --tp 2
 ```
 
-The remote probe checks the immutable HF snapshot using metadata/header range reads only. Mixed K within one routed layer is a supported layout.
+For the canonical TP2 snapshot, use the metadata-attestation probe rather than the generic remote probe:
+
+```bash
+python3 scripts/probe_tp2_attestation.py
+```
+
+Require:
+
+```text
+REMOTE_METADATA_ATTESTATION=PASS
+```
+
+This fetches only config/index JSON plus safetensors header ranges from the exact locked HF revision. It compares the remote raw header hashes against the checked-in two-node receipt and does not download tensor payloads.
 
 ## Gate 1: materialize the exact snapshot
 
@@ -55,26 +70,42 @@ ALLOW_SOURCE_ARTIFACT_DOWNLOAD=1 \
   /large/models/DSV4.1-Flash-SAGE-EXL3-TP2
 ```
 
-Keep the snapshot and Hugging Face/Xet caches on a sufficiently large filesystem.
+Keep the snapshot and Hugging Face/Xet caches on a sufficiently large filesystem. TP2 materialization now finishes through the same strict attested validator described below.
 
-## Gate 2: physical pack validation
+## Gate 2: physical + runtime-metadata validation
+
+For the canonical TP2 snapshot use:
 
 ```bash
-python3 scripts/validate_pack.py \
+python3 scripts/check_tp2_pack.py \
   /large/models/DSV4.1-Flash-SAGE-EXL3-TP2 \
-  --topology tp2 \
-  --reserve-gib 32
+  --reserve-gib 32 \
+  --strict-locked-snapshot
 ```
 
-The validator still fails closed on missing/pointer/truncated shards, index/header disagreement, invalid offsets, dtype/shape byte-count mismatch, K outside the pinned K2–K8 capability, and invalid source-format V4.1 metadata.
-
-Require:
+Require all three:
 
 ```text
+Runtime metadata source: locked_snapshot_attestation
+Metadata attestation match: True
 DEPLOYABLE_CURRENT_LOADER=YES
 ```
 
-This means loader-format compatible only.
+The generic structural validator remains fail-closed. The attestation can satisfy only the four legacy metadata declarations that are absent from the canonical config. It cannot waive missing/pointer/truncated shards, index/header disagreement, invalid offsets, dtype/shape byte-count mismatch, unsupported K, malformed shards, or disk-reserve failures.
+
+The attestation is **header/layout identity**, not a full 446 GB payload checksum. It binds the runtime metadata to the observed config SHA, all 31 raw safetensors header SHA256 values, tensor count, total shard bytes, K histogram and codebook-marker counts.
+
+Inspect the exact runtime-only override if desired:
+
+```bash
+python3 scripts/check_tp2_pack.py \
+  /large/models/DSV4.1-Flash-SAGE-EXL3-TP2 \
+  --reserve-gib 32 \
+  --strict-locked-snapshot \
+  --print-hf-overrides
+```
+
+The checkpoint files remain unchanged. `serve_tp2.sh` repeats strict validation inside the serving container and passes the resulting metadata to vLLM through a single quoted `--hf-overrides` argument.
 
 ## Gate 3: nonresident Engram
 
@@ -86,12 +117,20 @@ Build the derived runtime once:
 bash scripts/build_disk_engram_runtime.sh
 ```
 
-Start both Spark containers with the TP2 profile, setting the same in-container model path on each host:
+The recipe supports either of these local mount styles:
+
+```text
+host exact checkpoint directory -> /models      and MODEL=/models
+host parent model directory      -> /models      and MODEL=/models/<snapshot>
+```
+
+For an exact-directory mount:
 
 ```bash
 export DISK_ENGRAM_PROFILE="$PWD/profiles/tp2-disk-engram.env"
-export MODEL=/models/DSV4.1-Flash-SAGE-EXL3-TP2
-export VLLM_ENGRAM_MODEL_DIR="$MODEL"
+export MODEL_DIR=/large/models/DSV4.1-Flash-SAGE-EXL3-TP2
+export MODEL=/models
+export VLLM_ENGRAM_MODEL_DIR=/models
 
 bash scripts/start_disk_engram_cluster.sh head
 # on Spark 2: bash scripts/start_disk_engram_cluster.sh worker
@@ -164,19 +203,20 @@ Then qualify context only from measured headroom:
 
 Before calling TP2 deployable, retain:
 
-1. exact HF revision and complete shard validation;
-2. mixed-K histogram/layout receipt;
-3. exact runtime lock;
-4. two Ray GPU nodes and NCCL collective pass;
-5. topology identity (`EP2` or pure `MoE-TP2`);
-6. nonresident Engram path and staging budget;
-7. successful full load;
-8. `/v1/models` ready;
-9. deterministic smoke/parity evidence;
-10. per-node memory high-water mark;
-11. actual EXL3/kernel dispatch receipt;
-12. repeated decode stability;
-13. EP2-vs-TP2 A/B only after both are individually correct;
-14. DSpark only after the base path is stable.
+1. exact HF revision + remote metadata-attestation PASS;
+2. local strict physical/header validation + metadata-attestation PASS;
+3. mixed-K histogram/layout receipt;
+4. exact runtime lock;
+5. two Ray GPU nodes and NCCL collective pass;
+6. topology identity (`EP2` or pure `MoE-TP2`);
+7. nonresident Engram path and staging budget;
+8. successful full load;
+9. `/v1/models` ready;
+10. deterministic smoke/parity evidence;
+11. per-node memory high-water mark;
+12. actual EXL3/kernel dispatch receipt;
+13. repeated decode stability;
+14. EP2-vs-TP2 A/B only after both are individually correct;
+15. DSpark only after the base path is stable.
 
 `TP2_ALLOW_UNVALIDATED=1` remains a loader-development bypass only. Do not use it for benchmark/deployment claims.
