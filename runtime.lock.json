@@ -1,6 +1,6 @@
 {
   "schema": "dsv41-exl3-runtime-lock.v1",
-  "generated_at": "2026-09-12T20:11:00Z",
+  "generated_at": "2026-09-13T04:06:00Z",
   "base_image": {
     "ref": "vllm/vllm-openai:deepseekv41-flash-0909",
     "digest": null,
@@ -8,7 +8,7 @@
   },
   "vllm_exl3": {
     "repo": "https://github.com/vcruz305/vllm-exl3.git",
-    "commit": "ee8c2c171bbe0d036a3accb24a76af5a95506748"
+    "commit": "5666d1b4a55ef2237797eaee60cbb042e933f375"
   },
   "exllamav3": {
     "repo": "https://github.com/turboderp-org/exllamav3.git",
@@ -20,9 +20,14 @@
     "accepted_exl3_config_k": [2, 3, 4, 5, 6, 7, 8],
     "exllamav3_moe_kernel_k": [1, 2, 3, 4, 5, 6, 7, 8],
     "native_p2b_k": [2, 3, 4],
-    "routed_allocation_scope": "one_k_per_routedexperts_transformer_layer",
-    "tensor_level_mixed_k_within_layer": false,
-    "diagnostic_shape_overlap": "opt_in_coordinate_preserving",
+    "routed_allocation_scope": "per_expert_exact_trellis_shapes",
+    "tensor_level_mixed_k_within_layer": true,
+    "heterogeneous_mixed_k_dispatch": "linear_exl3_python_loop",
+    "uniform_k_dispatch": "fused_when_available",
+    "heterogeneous_mixed_k_cudagraph_qualified": false,
+    "mixed_k_first_boot": "eager",
+    "arena_prescan_placement_contract": "linear_contiguous_global_expert_ids",
+    "diagnostic_shape_overlap": "superseded_by_exact_shape_trellis_loading",
     "tp_geometry_source": "RoutedExperts.moe_config.moe_parallel_config_before_process_tp"
   },
   "models": {
@@ -30,15 +35,15 @@
       "repo_id": "vcruz305/DSV4.1-Flash-EXL3-4.75bpw",
       "revision": "e971fd559aed165dc9db20c75948b964cef81410",
       "expected_shards": 32,
-      "status": "source_artifact_pending_vllm_layout_validation",
-      "required_loader_contract": "layer_uniform_routed_k"
+      "status": "mixed_k_loader_ready_pending_disk_engram_full_serve",
+      "required_loader_contract": "per_expert_mixed_k_routed_trellis"
     },
     "tp2": {
       "repo_id": "vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw",
       "revision": "e831e9e4d6bfeafa6d630848296417b1393404a3",
       "expected_shards": 31,
-      "status": "source_artifact_pending_vllm_layout_validation",
-      "required_loader_contract": "layer_uniform_routed_k"
+      "status": "mixed_k_loader_ready_pending_tp2_capacity_qualification",
+      "required_loader_contract": "per_expert_mixed_k_routed_trellis"
     }
   },
   "first_boot": {
