@@ -1,73 +1,104 @@
 # Third-party notices and provenance
 
-This repository contains original recipe/orchestration code and references external projects. It does **not** redistribute model weights or vendor the DeepSeek V4.1 model implementation.
+This repository contains original recipe/orchestration code, references external projects, and contains an **explicit experimental vLLM overlay** under `overlays/disk-engram/`. It does not redistribute DeepSeek model weights.
 
 ## DeepSeek
 
 - Project/model: `deepseek-ai/DeepSeek-V4.1-Flash`
-- Role here: model architecture, tokenizer behavior, reasoning/tool protocol, DSpark training/runtime contract and checkpoint formats.
+- Role: model architecture, checkpoint formats, tokenizer/tool protocol and DSpark contract.
 - License: use the license published with the model/checkpoint you download.
 
 ## vLLM
 
 - Project: https://github.com/vllm-project/vllm
-- Dedicated V4.1 image used by this recipe: `vllm/vllm-openai:deepseekv41-flash-0909`
-- Role here: DeepSeek V4.1 architecture implementation, distributed execution, OpenAI server, sparse attention/indexer, DSpark runtime and source MXFP4/MXFP8 support.
+- Dedicated V4.1 image: `vllm/vllm-openai:deepseekv41-flash-0909`
+- Role: DeepSeek V4.1 graph, distributed execution, OpenAI server, Engram, sparse attention/indexer and DSpark runtime.
 - Upstream license: Apache-2.0.
 
-The command-line settings in this repository are independently assembled from public vLLM interfaces and the public DeepSeek-V4.1 recipe. No vLLM source files are copied here.
+The baseline recipe uses public vLLM interfaces without copying vLLM source. The **disk-Engram experimental overlay is an exception**: it contains copied/adapted Apache-2.0 vLLM files with their upstream SPDX/copyright headers retained.
+
+The exact upstream source commit represented by the dedicated image tag has not been independently resolved, so this repository deliberately does not invent one. The image tag plus recipe runtime lock define the current overlay compatibility boundary; any base-image change requires requalification.
 
 ## ExLlamaV3
 
 - Project: https://github.com/turboderp-org/exllamav3
 - Pinned revision: `be57335b087e4f001c5caae061544df3c06ba01e`
-- Role here: EXL3 trellis format, codebooks and packed execution used by `vllm-exl3`.
-- Upstream license: MIT (verify the pinned checkout for exact notices).
+- Role: EXL3 trellis format, codebooks and packed execution.
+- Upstream license: MIT; verify the pinned checkout for exact notices.
 
 ## vllm-exl3
 
 - Project: https://github.com/vcruz305/vllm-exl3
-- Pinned revision: `ee8c2c171bbe0d036a3accb24a76af5a95506748`
-- Role here: vLLM quantization plugin, routed-expert EXL3 loading/execution, source-quantization delegation, DeepSeek V4.1 TP/EP planning, mixed-K capability declaration, current-vLLM MoE TP/EP geometry compatibility, and native ABI-3 dynamic MoE geometry.
-- License at the pinned revision: AGPL-3.0-only, with additional historical/third-party notices in that repository.
+- Pinned revision: `5666d1b4a55ef2237797eaee60cbb042e933f375`
+- License: AGPL-3.0-only plus historical/third-party notices in that repository.
 
-The pinned history includes PR #9 by `@fattchris`, which contributed:
+### PR #9 — @fattchris
 
-- setuptools>=77-compatible relative CUDA extension source paths;
-- an explicitly opt-in diagnostic shape-mismatch mode;
-- coordinate-preserving overlap copies for that diagnostic path;
-- regression tests preserving the default hard-fail behavior.
+Contributed GB10/setuptools compatibility and diagnostic shape handling, including relative CUDA extension source paths and regression coverage. The diagnostic behavior hard-failed by default.
 
-The subsequent mainline TP/EP compatibility layer resolves the authoritative current-vLLM geometry from `RoutedExperts.moe_config.moe_parallel_config` before any process-wide TP fallback. This prevents EP layouts (MoE TP=1) from being incorrectly sliced according to the process TP world size.
+### PR #10 — @Blackwellboy
 
-The runtime image builds the plugin from its own source repository so its license and attribution files remain available in `/opt/vllm-exl3`.
+Original contributor commit:
 
-## GB10 recipe build / RoCE contribution
+```text
+74191ec2de80c961044b499e97646510784896e4
+```
 
-Recipe PR #1 by `@fattchris` supplied hardware-validated 4× DGX Spark findings that were integrated into the mainline recipe rather than merged verbatim after the repository had diverged. The integrated work includes:
+GitHub records the original PR as merged. It contributed the core **per-expert/per-projection mixed-K routed EXL3 implementation**:
 
-- conditional creation of the `python` alias in the dedicated V4.1 image;
-- dynamic discovery of the NVIDIA cuSPARSE header include directory;
-- configurable `VLLM_EXL3_REPO` build input;
-- fail-safe RDMA device passthrough and RoCE/NCCL configuration.
+- exact heterogeneous K3–K8 trellis geometry inside one routed layer;
+- support for `w1/w2/w3` using different K inside one expert;
+- contiguous per-shape trellis arenas/direct-fill path;
+- preservation of the uniform-K fused fast path;
+- correctness-first `LinearEXL3` fallback for heterogeneous layers;
+- synthetic mixed-K/loader/arena regression tests;
+- 4× DGX Spark evidence that loading proceeded beyond the former 64-vs-48 trellis failure.
 
-The mainline integration additionally preserves the locked ExLlamaV3 build argument, applies Spark-specific interface defaults only when those interfaces exist, and refuses to replace an existing runtime container without explicit opt-in.
+Mainline hardening added after that contribution explicitly marks heterogeneous mixed-K as eager-first/not CUDA-graph-qualified and disables arena prescan for non-linear/EPLB expert placement.
+
+## GB10 build / RoCE contribution — @fattchris
+
+Recipe PR #1 supplied hardware-validated 4× DGX Spark findings integrated into the mainline recipe, including conditional Python alias creation, dynamic cuSPARSE include discovery, configurable plugin source and guarded RDMA/RoCE settings. Mainline integration additionally preserved locked build inputs and non-destructive container startup.
+
+## Disk-backed Engram contribution — @Blackwellboy
+
+Recipe PR #2 original contributor commit:
+
+```text
+65c160e565fa4f0a01e55f433ab5868207f04401
+```
+
+The contribution established the guarded node-local disk-backed Engram direction after resident TP4 Engram reached the GB10 unified-memory cliff. Its core contribution includes:
+
+- `EngramConfig.disk_backed` experimental mode;
+- nonresident Engram embedding placeholders;
+- skipping full Engram embedding tensor materialization;
+- bounded row staging from local safetensors backing;
+- TP ownership handling;
+- synthetic parity, real-slice bit-exact parity and stress evidence;
+- TP4 disk-Engram qualification profile and memory watchdog.
+
+Mainline hardening on top of that contribution adds:
+
+- a reproducible derived `Dockerfile.disk-engram` instead of manual site-packages editing;
+- all-node Ray disk-Engram preflight;
+- propagation of disk mode/model path into Ray workers and the vLLM process;
+- exact-container OOM guard targeting;
+- caller/profile precedence protection;
+- eager-first mixed-K qualification contract;
+- retirement of resident Engram as the normal TP4 first gate.
+
+### Overlay files
+
+The experimental overlay contains:
+
+- `overlays/disk-engram/vllm/config/engram.py`
+- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram.py`
+- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram_disk.py`
+- `overlays/disk-engram/vllm/model_executor/model_loader/weight_utils.py`
+
+Copied/adapted vLLM files retain Apache-2.0 headers. The new disk helper uses the same license/provenance boundary documented in its source header.
 
 ## NVIDIA / CUDA / DGX Spark
 
-DGX Spark, CUDA, NVIDIA drivers and container runtime components are proprietary NVIDIA products with their own licenses. This repository does not redistribute them.
-
-## Community Spark work
-
-Other public DeepSeek V4.1 Spark experiments may use disk-backed Engram, FlashInfer SM12x patches, indexer changes or JIT prebuilds. The **baseline** recipe intentionally does not bake those patches into the default image. Experimental overlays must remain explicitly opt-in.
-
-## Experimental overlay: `overlays/disk-engram/`
-
-Optional qualification overlay (not the silent baseline) adapting Apache-2.0 vLLM Engram / weight-loader code for node-local NVMe non-resident Engram on GB10 UMA:
-
-- `overlays/disk-engram/vllm/config/engram.py` — adds `EngramConfig.disk_backed`
-- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram.py` — disk-backed wiring
-- `overlays/disk-engram/vllm/models/deepseek_v4_1/common/engram_disk.py` — new staging/backing helper (Apache-2.0; reuses pinned vLLM dequant semantics; not TonoKen3 source)
-- `overlays/disk-engram/vllm/model_executor/model_loader/weight_utils.py` — Apache-2.0 vLLM `weight_utils.py` with Engram embed skip + `posix_fadvise` DONTNEED for disk-backed loads
-
-Apply only against the image-pinned DeepSeek V4.1 runtime documented in `runtime.lock.json` / `overlays/disk-engram/README.md`. Upstream vLLM license: Apache-2.0 (https://github.com/vllm-project/vllm).
+DGX Spark, CUDA, NVIDIA drivers and container runtime components are NVIDIA products with their own licenses. This repository does not redistribute them.
