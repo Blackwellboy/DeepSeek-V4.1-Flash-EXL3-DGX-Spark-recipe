@@ -57,6 +57,7 @@ fi
 
 export VLLM_ENGRAM_DISK_BACKED=1
 export VLLM_ENGRAM_MODEL_DIR="${VLLM_ENGRAM_MODEL_DIR:-$MODEL_RESOLVED}"
+export VLLM_EXL3_MODEL_DIR="$VLLM_ENGRAM_MODEL_DIR"
 
 # This is the correctness/capacity qualification path. Heterogeneous mixed-K
 # currently dispatches through the LinearEXL3 Python loop and is not yet
@@ -77,13 +78,17 @@ if [[ "${EXTRA_VLLM_ARGS:-}" != *"disk_backed"* ]]; then
 fi
 export EXTRA_VLLM_ARGS
 
-if docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-  if ! docker exec "$CONTAINER_NAME" test -f \
-    "$VLLM_ENGRAM_MODEL_DIR/model.safetensors.index.json"; then
-    echo "ERROR: disk Engram model directory is not materialized in the head container:" >&2
-    echo "  $VLLM_ENGRAM_MODEL_DIR/model.safetensors.index.json" >&2
-    exit 2
-  fi
+if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+  echo "ERROR: head container '$CONTAINER_NAME' is not running." >&2
+  echo "Start every node with scripts/start_disk_engram_cluster.sh first." >&2
+  exit 2
+fi
+
+if ! docker exec "$CONTAINER_NAME" test -f \
+  "$VLLM_ENGRAM_MODEL_DIR/model.safetensors.index.json"; then
+  echo "ERROR: disk Engram model directory is not materialized in the head container:" >&2
+  echo "  $VLLM_ENGRAM_MODEL_DIR/model.safetensors.index.json" >&2
+  exit 2
 fi
 
 cat >&2 <<EOF
@@ -99,14 +104,22 @@ Eager:                    1 (required for mixed-K qualification)
 Max model len:            8192
 Max num seqs:             1
 
-Requirements:
-  1. Runtime/image must provide EngramConfig.disk_backed (see overlays/disk-engram/).
-  2. The overlay must be applied to the exact locked V4.1 runtime.
-  3. Every Ray node must expose the same local checkpoint path and disk-Engram env.
-  4. Arm scripts/watch_oom_guard.sh (WARN=24 GiB, ABORT=16 GiB) before load.
-  5. Runtime must contain the per-expert mixed-K vllm-exl3 integration.
+Fail-closed gates before model load:
+  1. every Ray GPU node has disk-Engram env enabled;
+  2. every node has the exact local checkpoint/index at the same container path;
+  3. every node imports EngramConfig.disk_backed + the weight-loader skip;
+  4. every node has the mixed-K-capable vllm-exl3 runtime;
+  5. node-local backing is not a network filesystem.
 ========================================================================
 EOF
+
+echo "Running all-node disk-Engram preflight..." >&2
+docker exec "$CONTAINER_NAME" \
+  python /recipe/scripts/check_disk_engram_cluster.py 4 "$VLLM_ENGRAM_MODEL_DIR"
+
+echo "DISK_ENGRAM_CLUSTER_PREFLIGHT=PASS" >&2
+
+echo "Reminder: arm scripts/watch_oom_guard.sh on every node before a real load." >&2
 
 exec env \
   MODEL="$MODEL_RESOLVED" \
@@ -120,6 +133,7 @@ exec env \
   NATIVE_MOE=0 \
   VLLM_ENGRAM_DISK_BACKED=1 \
   VLLM_ENGRAM_MODEL_DIR="$VLLM_ENGRAM_MODEL_DIR" \
+  VLLM_EXL3_MODEL_DIR="$VLLM_ENGRAM_MODEL_DIR" \
   EXTRA_VLLM_ARGS="$EXTRA_VLLM_ARGS" \
   DRY_RUN="$DRY" \
   "$SCRIPT_DIR/serve_tp4.sh"
