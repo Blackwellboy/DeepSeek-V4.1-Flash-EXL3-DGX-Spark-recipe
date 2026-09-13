@@ -121,6 +121,29 @@ if [[ -n "${MODEL_DIR:-}" ]]; then
   DOCKER_ARGS+=( -v "$MODEL_DIR:/models" )
 fi
 
+# Disk-backed Engram must be visible to the Ray processes on every node, not
+# only to the later head-side `docker exec` that starts vLLM. The weight loader
+# consults this environment before it decides whether the huge Engram tensors
+# should be skipped, and mixed-K arena prescan uses the same local model path.
+if is_true "${VLLM_ENGRAM_DISK_BACKED:-0}"; then
+  if [[ -z "${MODEL_DIR:-}" ]]; then
+    echo "ERROR: VLLM_ENGRAM_DISK_BACKED=1 requires MODEL_DIR on every node." >&2
+    exit 2
+  fi
+  ENGRAM_MODEL_IN_CONTAINER="${VLLM_ENGRAM_MODEL_DIR:-${MODEL:-/models}}"
+  if [[ "$ENGRAM_MODEL_IN_CONTAINER" != /* ]]; then
+    echo "ERROR: VLLM_ENGRAM_MODEL_DIR must be an absolute in-container path." >&2
+    exit 2
+  fi
+  DOCKER_ARGS+=(
+    -e VLLM_ENGRAM_DISK_BACKED=1
+    -e VLLM_ENGRAM_MODEL_DIR="$ENGRAM_MODEL_IN_CONTAINER"
+    -e VLLM_EXL3_MODEL_DIR="$ENGRAM_MODEL_IN_CONTAINER"
+    -e VLLM_EXL3_TRELLIS_ARENA=${VLLM_EXL3_TRELLIS_ARENA:-1}
+    -e VLLM_EXL3_ARENA_PRESCAN=${VLLM_EXL3_ARENA_PRESCAN:-1}
+  )
+fi
+
 if [[ "$ROLE" == "head" ]]; then
   if [[ "$NODE_IP" != "$HEAD_IP" ]]; then
     echo "ERROR: head NODE_IP ($NODE_IP) must equal HEAD_IP ($HEAD_IP)." >&2
@@ -131,7 +154,7 @@ else
   RAY_ARGS=(start --address="$HEAD_IP:$RAY_PORT" --node-ip-address="$NODE_IP" --num-gpus=1 --disable-usage-stats --block)
 fi
 
-echo "Starting $ROLE container '$CONTAINER_NAME' on $NODE_IP (RDMA=$rdma_enabled)"
+echo "Starting $ROLE container '$CONTAINER_NAME' on $NODE_IP (RDMA=$rdma_enabled disk_engram=${VLLM_ENGRAM_DISK_BACKED:-0})"
 docker "${DOCKER_ARGS[@]}" "$IMAGE" "${RAY_ARGS[@]}"
 
 echo "Container started. Recent logs:"
