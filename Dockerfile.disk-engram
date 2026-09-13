@@ -94,5 +94,9 @@ print('vLLM:', vllm.__version__)
 print('vllm-exl3 mixed-K:', diag['mixed_k'])
 PY
 
-ENV VLLM_ENGRAM_DISK_BACKED=1
+# Do not enable disk mode in the image itself. The dedicated cluster wrapper
+# activates it together with the exact local model path on every node; running
+# this image through the ordinary launcher therefore cannot create a half-
+# configured disk mode silently.
+LABEL ai.tensorward.dsv41.disk-engram-overlay="blackwellboy-pr2+hardened"
 WORKDIR /workspace
