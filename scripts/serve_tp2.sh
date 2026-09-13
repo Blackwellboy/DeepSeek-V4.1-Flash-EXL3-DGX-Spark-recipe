@@ -6,19 +6,21 @@ source "$SCRIPT_DIR/lib.sh"
 
 MODEL_RESOLVED="$(resolve_model_for_tp 2)"
 
-# The published TP2 pack is tensor-level mixed-K and has also seen reports of
-# non-materialized/invalid shard headers. Do not launch it directly from a repo
-# id until a compatible repack is published. Materialize + validate first.
+# The published TP2 pack is now representable by the pinned mixed-K loader, but
+# remote repo-id launch is still fail-closed because TP2 has not completed its
+# two-Spark capacity/nonresident-Engram qualification. Materialize + validate
+# the exact locked snapshot before a real boot.
 if [[ "$MODEL_RESOLVED" != /models/* ]]; then
   if ! is_true "${TP2_ALLOW_UNVALIDATED:-0}"; then
     cat >&2 <<EOF
 ERROR: TP2 launch is fail-closed for remote/unvalidated checkpoints.
 
 Current published repo: $MODEL_RESOLVED
-Known blockers under investigation:
-  - shard materialization/integrity must be verified;
-  - tensor-level mixed K2-K8 is incompatible with the pinned layer-uniform loader;
-  - TP2 requires streamed/nonresident Engram and measured disk/RAM headroom.
+Current status:
+  - per-expert/per-projection mixed K2-K8 is supported by the pinned loader;
+  - shard materialization/integrity must still be verified on the exact snapshot;
+  - TP2 requires nonresident disk-backed Engram and measured UMA headroom;
+  - EP2 is the correctness baseline; pure MoE TP2 is an explicit A/B candidate.
 
 Materialize onto a large local/external mount first:
   bash scripts/materialize_tp2.sh /large/model/path/DSV4.1-Flash-SAGE-EXL3-TP2
