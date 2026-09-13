@@ -39,11 +39,15 @@ class DiskEngramContractTests(unittest.TestCase):
     def test_oom_guard_targets_one_exact_container(self) -> None:
         guard = (ROOT / "scripts/oom_guard.sh").read_text()
         wrapper = (ROOT / "scripts/watch_oom_guard.sh").read_text()
+        checker = (ROOT / "scripts/check_oom_guards.sh").read_text()
         self.assertIn("OOM_GUARD_CONTAINER_NAME", guard)
         self.assertIn('grep -Fx "$TARGET_CONTAINER"', guard)
         self.assertNotIn("grep -E '^(dsv41|deepseek-v41)'", guard)
         self.assertIn("OOM_GUARD_CONTAINER_NAME", wrapper)
         self.assertNotIn("OOM_GUARD_CONTAINER_MATCH", wrapper)
+        self.assertIn("OOM_GUARD_CLUSTER=PASS", checker)
+        self.assertIn("armed != EXPECTED", checker)
+        self.assertIn("alive != EXPECTED", checker)
 
     def test_resident_engram_requires_explicit_retest(self) -> None:
         text = (ROOT / "scripts/tp4_min_fit.sh").read_text()
@@ -61,6 +65,7 @@ class DiskEngramContractTests(unittest.TestCase):
             "DSPARK=0",
             "EAGER=1",
             "NATIVE_MOE=0",
+            "check_oom_guards.sh",
         ):
             self.assertIn(expected, text)
 
