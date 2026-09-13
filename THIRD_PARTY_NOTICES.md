@@ -118,3 +118,18 @@ Copied/adapted vLLM files retain Apache-2.0 headers. The new disk helper uses th
 ## NVIDIA / CUDA / DGX Spark
 
 DGX Spark, CUDA, NVIDIA drivers and container runtime components are NVIDIA products with their own licenses. This repository does not redistribute them.
+
+## tonyd2wild / Tech2Wild SM12x sparse-MLA page patches
+
+- Source: https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark
+- Commit: fc725ecf10869c184f4347dd73336536d395753c
+- Files adapted (minimal semantic port onto Victor image-pinned V4.1 sources):
+  - `patch/attention.py` → `overlays/sm12x-sparse-mla/vllm/models/deepseek_v4_1/attention.py`
+  - `patch/flashinfer_sparse.py` → `overlays/sm12x-sparse-mla/vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py`
+  - `patch/sparse_swa.py` → `overlays/sm12x-sparse-mla/vllm/v1/attention/backends/mla/sparse_swa.py`
+- License: Apache-2.0 (upstream LICENSE)
+- Original authors noted in source comments: Tech2Wild / Kai (2026-09-10)
+- Purpose: SM12x 64-state compressed/indexer pages + SWA page-size hooks so
+  FlashInfer SM120 DSV4 decode (topk runtime, page_block_size=64) and DeepGEMM
+  paged MQA logits (`block_kv` 32/64) agree with global `--block-size 128`.
+

@@ -1,0 +1,3 @@
+attention.py models/deepseek_v4_1/attention.py
+flashinfer_sparse.py models/deepseek_v4_1/nvidia/flashinfer_sparse.py
+sparse_swa.py v1/attention/backends/mla/sparse_swa.py
