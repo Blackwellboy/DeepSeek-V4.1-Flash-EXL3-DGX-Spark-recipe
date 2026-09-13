@@ -8,6 +8,7 @@
 #   OOM_GUARD_WARN_GIB=24
 #   OOM_GUARD_ABORT_GIB=16
 #
+# The guard may stop/kill a container, so it targets one exact container name.
 # Do not hard-code private host inventories in this recipe.
 set -euo pipefail
 
@@ -19,6 +20,13 @@ SCRIPT_NAME=oom_guard.sh
 
 if [[ ! -f "$GUARD_SCRIPT" ]]; then
   echo "ERROR: missing $GUARD_SCRIPT" >&2
+  exit 2
+fi
+
+# Keep the remote directory shell-safe because it is interpolated into a
+# BatchMode SSH command below.
+if [[ ! "$REMOTE_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  echo "ERROR: OOM_GUARD_REMOTE_DIR must be a simple absolute path" >&2
   exit 2
 fi
 
@@ -35,7 +43,7 @@ fi
 
 deploy() {
   local h="$1"
-  ssh -o BatchMode=yes "$h" "mkdir -p $REMOTE_DIR/receipts"
+  ssh -o BatchMode=yes "$h" "mkdir -p '$REMOTE_DIR/receipts'"
   scp -o BatchMode=yes "$GUARD_SCRIPT" "$h:$REMOTE_DIR/$SCRIPT_NAME"
 }
 
@@ -48,49 +56,53 @@ for h in "${HOSTS[@]}"; do
     start)
       WARN="${OOM_GUARD_WARN_GIB:-24}"
       ABORT="${OOM_GUARD_ABORT_GIB:-16}"
-      MATCH="${OOM_GUARD_CONTAINER_MATCH:-dsv41-exl3}"
+      TARGET="${OOM_GUARD_CONTAINER_NAME:-dsv41-exl3}"
+      if [[ ! "$TARGET" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "ERROR: OOM_GUARD_CONTAINER_NAME contains unsafe characters: $TARGET" >&2
+        exit 2
+      fi
       deploy "$h"
-      ssh -o BatchMode=yes "$h" "mkdir -p $REMOTE_DIR/receipts
-        if [[ -f $REMOTE_DIR/oom_guard.pid ]] && kill -0 \$(cat $REMOTE_DIR/oom_guard.pid) 2>/dev/null; then
+      ssh -o BatchMode=yes "$h" "mkdir -p '$REMOTE_DIR/receipts'
+        if [[ -f '$REMOTE_DIR/oom_guard.pid' ]] && kill -0 \$(cat '$REMOTE_DIR/oom_guard.pid') 2>/dev/null; then
           echo ALREADY_RUNNING; exit 0; fi
-        nohup env OOM_GUARD_DIR=$REMOTE_DIR \
-          OOM_GUARD_WARN_GIB=$WARN \
-          OOM_GUARD_ABORT_GIB=$ABORT \
-          OOM_GUARD_CONTAINER_MATCH=$MATCH \
-          OOM_GUARD_DRY_ABORT=${OOM_GUARD_DRY_ABORT:-0} \
-          OOM_GUARD_SYNTHETIC_TEST=${OOM_GUARD_SYNTHETIC_TEST:-0} \
-          bash $REMOTE_DIR/$SCRIPT_NAME >/dev/null 2>&1 &
+        nohup env OOM_GUARD_DIR='$REMOTE_DIR' \
+          OOM_GUARD_WARN_GIB='$WARN' \
+          OOM_GUARD_ABORT_GIB='$ABORT' \
+          OOM_GUARD_CONTAINER_NAME='$TARGET' \
+          OOM_GUARD_DRY_ABORT='${OOM_GUARD_DRY_ABORT:-0}' \
+          OOM_GUARD_SYNTHETIC_TEST='${OOM_GUARD_SYNTHETIC_TEST:-0}' \
+          bash '$REMOTE_DIR/$SCRIPT_NAME' >/dev/null 2>&1 &
         sleep 0.5
-        cat $REMOTE_DIR/state.env"
+        cat '$REMOTE_DIR/state.env'"
       ;;
     stop)
       ssh -o BatchMode=yes "$h" "
-        if [[ -f $REMOTE_DIR/oom_guard.pid ]]; then
-          kill \$(cat $REMOTE_DIR/oom_guard.pid) 2>/dev/null || true
-          rm -f $REMOTE_DIR/oom_guard.pid
+        if [[ -f '$REMOTE_DIR/oom_guard.pid' ]]; then
+          kill \$(cat '$REMOTE_DIR/oom_guard.pid') 2>/dev/null || true
+          rm -f '$REMOTE_DIR/oom_guard.pid'
         fi
-        rm -f $REMOTE_DIR/state.env
+        rm -f '$REMOTE_DIR/state.env'
         echo STOPPED"
       ;;
     status)
       ssh -o BatchMode=yes "$h" "
         echo HOST=\$(hostname -s)
-        if [[ -f $REMOTE_DIR/state.env ]]; then cat $REMOTE_DIR/state.env; else echo OOM_GUARD_ARMED=NO; fi
-        if [[ -f $REMOTE_DIR/oom_guard.pid ]] && kill -0 \$(cat $REMOTE_DIR/oom_guard.pid) 2>/dev/null; then
-          echo OOM_GUARD_ALIVE=YES PID=\$(cat $REMOTE_DIR/oom_guard.pid)
+        if [[ -f '$REMOTE_DIR/state.env' ]]; then cat '$REMOTE_DIR/state.env'; else echo OOM_GUARD_ARMED=NO; fi
+        if [[ -f '$REMOTE_DIR/oom_guard.pid' ]] && kill -0 \$(cat '$REMOTE_DIR/oom_guard.pid') 2>/dev/null; then
+          echo OOM_GUARD_ALIVE=YES PID=\$(cat '$REMOTE_DIR/oom_guard.pid')
         else
           echo OOM_GUARD_ALIVE=NO
         fi
-        ls -1t $REMOTE_DIR/receipts 2>/dev/null | head -3 || true
+        ls -1t '$REMOTE_DIR/receipts' 2>/dev/null | head -3 || true
         echo ---
       "
       ;;
     uninstall)
       ssh -o BatchMode=yes "$h" "
-        if [[ -f $REMOTE_DIR/oom_guard.pid ]]; then
-          kill \$(cat $REMOTE_DIR/oom_guard.pid) 2>/dev/null || true
+        if [[ -f '$REMOTE_DIR/oom_guard.pid' ]]; then
+          kill \$(cat '$REMOTE_DIR/oom_guard.pid') 2>/dev/null || true
         fi
-        rm -rf $REMOTE_DIR
+        rm -rf '$REMOTE_DIR'
         echo UNINSTALLED"
       ;;
     *)
