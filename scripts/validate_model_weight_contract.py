@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import Counter
 from pathlib import Path
 
 
@@ -85,29 +84,28 @@ def main() -> int:
         "pack_n_tensors": len(pack),
     }
 
-    # Always require embed/head if claimed by architecture
-    hard_required = []
-    for name in ("embed.weight", "head.weight", "norm.weight"):
-        hard_required.append(name)
-
+    hard_required = ["embed.weight", "head.weight", "norm.weight"]
     missing_hard = [n for n in hard_required if n not in pack]
     report["missing_top"] = missing_hard
 
     base_index_path = args.base_index
     missing_by_family: dict[str, list[str]] = {}
+    missing_required: list[str] = []
     if base_index_path and base_index_path.is_file():
         base = load_index(base_index_path)
         required = [k for k in base if not is_routed_expert(k)]
-        missing = [k for k in required if k not in pack]
+        missing_required = [k for k in required if k not in pack]
         present = [k for k in required if k in pack]
-        for k in missing:
+        for k in missing_required:
             missing_by_family.setdefault(family(k), []).append(k)
         report.update(
             {
                 "EXPECTED_REQUIRED_TENSORS": len(required),
                 "PACK_PRESENT_REQUIRED_TENSORS": len(present),
-                "PACK_MISSING_REQUIRED_TENSORS": len(missing),
-                "missing_by_family_counts": {f: len(v) for f, v in sorted(missing_by_family.items())},
+                "PACK_MISSING_REQUIRED_TENSORS": len(missing_required),
+                "missing_by_family_counts": {
+                    f: len(v) for f, v in sorted(missing_by_family.items())
+                },
                 "MISSING_ATTN": len(missing_by_family.get("ATTN", [])),
                 "MISSING_SHARED": len(missing_by_family.get("SHARED", [])),
                 "MISSING_NORMS": len(missing_by_family.get("NORMS_FFN", [])),
@@ -116,29 +114,47 @@ def main() -> int:
                 "MISSING_OTHER": len(missing_by_family.get("OTHER", [])),
             }
         )
-        # Heuristic without base: backbone attn keys
-        backbone_attn = [k for k in pack if k.startswith("layers.") and ".attn." in k]
+        backbone_attn = [
+            k for k in pack if k.startswith("layers.") and ".attn." in k
+        ]
         report["pack_backbone_attn_keys"] = len(backbone_attn)
     else:
-        # Fail closed if scope claims routed-only EXL3 but no backbone attn present
-        backbone_attn = [k for k in pack if k.startswith("layers.") and (".attn." in k or "attn_norm" in k)]
+        backbone_attn = [
+            k
+            for k in pack
+            if k.startswith("layers.") and (".attn." in k or "attn_norm" in k)
+        ]
         report["pack_backbone_attn_keys"] = len(backbone_attn)
         report["EXPECTED_REQUIRED_TENSORS"] = None
         report["PACK_MISSING_REQUIRED_TENSORS"] = None
-        if qcfg.get("scope") == "deepseek_v41_routed_experts" and len(backbone_attn) == 0:
-            missing_by_family["ATTN"] = ["<all backbone layers.*.attn.* — none in pack>"]
+        if (
+            qcfg.get("scope") == "deepseek_v41_routed_experts"
+            and len(backbone_attn) == 0
+        ):
+            missing_by_family["ATTN"] = [
+                "<all backbone layers.*.attn.* — none in pack>"
+            ]
             report["MISSING_ATTN"] = "ALL"
             report["PACK_MISSING_REQUIRED_TENSORS"] = "UNKNOWN_WITHOUT_BASE_INDEX"
 
-    # Routed EXL3 presence (trellis)
-    trellis = [k for k in pack if k.endswith(".trellis") and ".ffn.experts." in k]
+    trellis = [
+        k for k in pack if k.endswith(".trellis") and ".ffn.experts." in k
+    ]
     report["pack_routed_trellis"] = len(trellis)
 
     failures: list[str] = []
     if missing_hard:
         failures.append("MISSING_TOP_LEVEL:" + ",".join(missing_hard))
+
+    # With an authoritative base index, *every* missing non-routed tensor is a
+    # contract failure. Family-specific labels below are diagnostics only; they
+    # must never accidentally allow VISION/MTP/ENGRAM/TOP/OTHER omissions through.
+    if missing_required:
+        failures.append(f"MISSING_REQUIRED_TENSORS:{len(missing_required)}")
+
     if report.get("MISSING_ATTN") in ("ALL",) or (
-        isinstance(report.get("MISSING_ATTN"), int) and report["MISSING_ATTN"] > 0
+        isinstance(report.get("MISSING_ATTN"), int)
+        and report["MISSING_ATTN"] > 0
     ):
         failures.append("MISSING_BACKBONE_ATTENTION")
     if isinstance(report.get("MISSING_SHARED"), int) and report["MISSING_SHARED"] > 0:
@@ -149,9 +165,12 @@ def main() -> int:
         failures.append("MISSING_FFN_NORMS")
     if isinstance(report.get("MISSING_GATE"), int) and report["MISSING_GATE"] > 0:
         failures.append("MISSING_FFN_GATES")
-    if qcfg.get("scope") == "deepseek_v41_routed_experts" and report["pack_backbone_attn_keys"] == 0:
-        if "MISSING_BACKBONE_ATTENTION" not in failures:
-            failures.append("MISSING_BACKBONE_ATTENTION")
+    if (
+        qcfg.get("scope") == "deepseek_v41_routed_experts"
+        and report["pack_backbone_attn_keys"] == 0
+        and "MISSING_BACKBONE_ATTENTION" not in failures
+    ):
+        failures.append("MISSING_BACKBONE_ATTENTION")
 
     report["failures"] = failures
     report["status"] = "PASS" if not failures else "FAIL"
