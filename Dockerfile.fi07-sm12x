@@ -23,6 +23,6 @@ ENV MAX_JOBS=4
 ENV FLASHINFER_NVCC_THREADS=1
 # Python-level decode contract (no GPU needed)
 RUN python3 -c "import flashinfer; from flashinfer.mla import supported_sparse_mla_sm120_configs as f; c=f()[\"dsv4\"]; assert c.supports_decode(num_heads=16, topk=1152), c; print(\"DECODE_16x1152_OK\", flashinfer.__version__, \"topks\", sorted(c.topks)[:8], \"runtime\", c.topk_is_runtime)"
-# Prewarm sparse_mla_sm120 JIT for sm_121a
-RUN FLASHINFER_CUDA_ARCH_LIST=12.1a MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 timeout 3600 python3 -c "from flashinfer.mla._sparse_mla_sm120 import get_sparse_mla_sm120_module; get_sparse_mla_sm120_module(); print(\"SPARSE_MLA_PREWARM_OK\")" \
- || echo "PREWARM_DEFERRED"
+# Prewarm sparse_mla_sm120 JIT for sm_121a. This is part of the image contract:
+# four Ray workers must never fall back to concurrent boot-time compilation.
+RUN FLASHINFER_CUDA_ARCH_LIST=12.1a MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 timeout 3600 python3 -c "from flashinfer.mla._sparse_mla_sm120 import get_sparse_mla_sm120_module; get_sparse_mla_sm120_module(); print(\"SPARSE_MLA_PREWARM_OK\")"
