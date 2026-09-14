@@ -67,6 +67,13 @@ def main() -> int:
     ap.add_argument("--keep-base-shards", action="store_true")
     args = ap.parse_args()
 
+    # Normalize filesystem roots once so merged-pack symlinks never depend on
+    # the caller's current working directory.
+    args.pack_dir = args.pack_dir.resolve()
+    args.base_index = args.base_index.resolve()
+    args.work_dir = args.work_dir.resolve()
+    args.out_dir = args.out_dir.resolve()
+
     def log(msg: str) -> None:
         print(msg, flush=True)
         log_path = args.work_dir / "logs" / "repair.log"
@@ -107,10 +114,9 @@ def main() -> int:
     else:
         repair_map = {}
 
-    # Incremental batch buffer
     batch: dict = {}
     batch_bytes = 0
-    max_batch = 4 * 1024**3  # flush every ~4GiB
+    max_batch = 4 * 1024**3
     shard_i = 1 + len({v for v in repair_map.values()})
 
     def flush_batch(force: bool = False) -> None:
@@ -122,7 +128,6 @@ def main() -> int:
         name = f"repair-nonrouted-{shard_i:05d}.safetensors"
         path = args.out_dir / name
         log(f"write {path} n={len(batch)} bytes={batch_bytes}")
-        # merge if file exists
         if path.exists():
             existing = {}
             with safe_open(str(path), framework="pt") as f:
@@ -149,17 +154,20 @@ def main() -> int:
             f"{args.base_revision}/{shard_name}"
         )
         local_shard = shard_dir / shard_name
-        # remove incomplete leftovers
         partial = local_shard.with_suffix(local_shard.suffix + ".partial")
         partial.unlink(missing_ok=True)
         if local_shard.exists():
-            # re-validate size via HEAD
             try:
-                req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "vllm-repair/1.0"})
+                req = urllib.request.Request(
+                    url, method="HEAD", headers={"User-Agent": "vllm-repair/1.0"}
+                )
                 with urllib.request.urlopen(req, timeout=60) as r:
                     exp = int(r.headers.get("Content-Length") or 0)
                 if exp and local_shard.stat().st_size != exp:
-                    log(f"size mismatch {local_shard.name}: {local_shard.stat().st_size} != {exp}; redownload")
+                    log(
+                        f"size mismatch {local_shard.name}: "
+                        f"{local_shard.stat().st_size} != {exp}; redownload"
+                    )
                     local_shard.unlink()
             except Exception as e:
                 log(f"HEAD warn {e}")
@@ -200,7 +208,6 @@ def main() -> int:
 
     flush_batch(force=True)
 
-    # Merge index
     merged = dict(pack_map)
     collisions = [k for k in repair_map if k in merged]
     if collisions:
@@ -233,10 +240,10 @@ def main() -> int:
         + "\n"
     )
     for shard in sorted(set(pack_map.values())):
-        src = args.pack_dir / shard
+        src = (args.pack_dir / shard).resolve()
         dst = args.out_dir / shard
         if not dst.exists() and src.exists():
-            os.symlink(src, dst)
+            os.symlink(str(src), str(dst))
 
     manifest["n_tensors"] = len(manifest["entries"])
     manifest["repair_gib"] = manifest["repair_bytes"] / 1024**3
